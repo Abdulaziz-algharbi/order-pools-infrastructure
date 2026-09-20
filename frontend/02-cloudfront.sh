@@ -130,7 +130,7 @@ else
       # PriceClass_100 = US/Canada/Europe edge locations only — the
       # cheapest tier. Fine for a dev/demo audience; widen to
       # PriceClass_All (all edge locations worldwide, higher cost) later
-      # if/when there's a genuinely global audience to serve.
+      # if/when there is a genuinely global audience to serve.
       PriceClass: "PriceClass_100"
     }' > "$DIST_CONFIG_FILE"
 

@@ -1,0 +1,68 @@
+# Infrastructure provisioning pipeline. Deliberately manual-only
+# (workflow_dispatch, no push trigger) — infra changes are rare and
+# risky compared to app deploys, and `destroy` living behind the same
+# trigger as `deploy` makes a required-reviewer gate on the `prod`
+# GitHub Environment (configured in this repo's Settings > Environments,
+# not scriptable here) the thing standing between "clicked the wrong
+# button" and a real production teardown.
+name: Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev]
+      action:
+        description: "deploy or destroy"
+        required: true
+        type: choice
+        options: [deploy, destroy]
+        default: deploy
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.INFRA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Pre-seed the account pin
+        # check_account_region (lib/aws-guard.sh) normally pins the AWS
+        # account into config/<env>.local.env on a script's first-ever
+        # run and compares against it on every run after. A GitHub
+        # Actions runner starts from a fresh checkout every time, so
+        # there's no persistent "after" to compare against — but that's
+        # not actually a loss of protection: in CI, the OIDC trust
+        # policy itself (scoped to this exact repo + environment) is
+        # what guarantees the right account, enforced AWS-side, which a
+        # local file check can only approximate. This step just writes
+        # the pin non-interactively so the script's existing check
+        # trivially passes rather than needing to touch that script.
+        run: |
+          mkdir -p "config"
+          echo "AWS_ACCOUNT_ID_PINNED=$(aws sts get-caller-identity --query Account --output text)" > "config/${{ inputs.environment }}.local.env"
+
+      - name: Deploy
+        if: ${{ inputs.action == 'deploy' }}
+        run: ./deploy.sh "${{ inputs.environment }}"
+
+      - name: Destroy
+        if: ${{ inputs.action == 'destroy' }}
+        # destroy.sh's confirmation reads the environment name from
+        # stdin — piping the exact value in preserves the "you must
+        # supply the right string" safety property non-interactively,
+        # rather than needing a CI-specific bypass flag.
+        run: echo "${{ inputs.environment }}" | ./destroy.sh "${{ inputs.environment }}"

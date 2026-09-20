@@ -98,6 +98,8 @@ $EDITOR config/dev.secrets.env               # fill in the real Atlas password, 
 
 `deploy.sh` deliberately stops after infrastructure — it never builds or ships application code itself (see [GitHub Actions](#9-github-actions) for why that split matters).
 
+If you also want GitHub Actions able to deploy this environment, run `./iam/02-github-oidc-roles.sh dev` once as well (not part of `deploy.sh`'s sequence — setting up CI trust roles is a deliberate, separate action, not something that should happen silently every time you provision infrastructure) and set the resulting role ARNs as GitHub environment variables per [GitHub Actions](#9-github-actions).
+
 ## 6. Prod deployment
 
 Not yet configured. `config/prod.env.example` is a placeholder — copy it to `config/prod.env`, fill in production values (region, CIDRs, and note the domain convention: `dev` uses `dev-api.<domain>`/`dev-app.<domain>`, reserving the bare `api.<domain>`/`app.<domain>` for `prod`), then run the exact same command sequence with `prod` in place of `dev`. Before treating a `prod` environment built this way as genuinely production-grade, revisit the trade-offs in [Security considerations](#18-security-considerations) — several were explicitly accepted for a dev/demo stage and may not be the right call once real traffic/users are involved (single EC2 instance with no ASG, in-place restart deploys, single NAT-less AZ egress path).
@@ -129,19 +131,37 @@ This is **pull-based**: the instance always initiates the S3 download and the pa
 
 ## 9. GitHub Actions
 
-**Planned, not yet implemented (Phase 6).** The intended design:
+Implemented (Phase 6). `iam/02-github-oidc-roles.sh <env>` creates one OIDC identity provider (account-wide, once) and three separate IAM roles, each trusted only by its own repo + this specific environment (via the token's `repository`/`environment` claims, not long-lived AWS access keys):
 
 ```text
-GitHub Actions (3 separate OIDC roles, least-privilege per repo)
-  order-pool-infra-deploy      -> broad, should sit behind a required-reviewer environment
-  order-pool-frontend-deploy   -> scoped to the frontend S3 bucket + its one CloudFront distribution
-  order-pool-backend-deploy    -> scoped to the artifact bucket + ssm:SendCommand on one tagged instance
-                                   + read of /order-pool/<env>/state/backend/* and /order-pool/<env>/backend/*
+order-pool-<env>-infra-deploy      -> broad (creates/destroys the whole stack); trusted by order-pools-infrastructure
+order-pool-<env>-frontend-deploy   -> scoped to the frontend S3 bucket + CreateInvalidation; trusted by order-pools-app
+order-pool-<env>-backend-deploy    -> scoped to the artifact bucket + ssm:SendCommand on Project/Environment-tagged
+                                       instances + read of /order-pool/<env>/state/backend/* and .../backend/*;
+                                       trusted by order-pools-backend
 ```
 
-Each role's trust policy is conditioned on that specific repo's OIDC `sub` claim — no long-lived AWS access keys anywhere. A GitHub Actions runner resolves resource IDs the same way your laptop does: `aws ssm get-parameter --name /order-pool/<env>/state/backend/instance-id`, etc. — this is why those IDs live in SSM Parameter Store as the canonical copy, not just a local file.
+The `infra-deploy` role uses AWS managed "FullAccess" policies for the services it provisions (EC2/ELB/S3/CloudFront/Route53/ACM/SSM) — a deliberate simplification for this project's scale, documented as such rather than silently glossed over. IAM itself is the one exception: `infra-deploy`'s IAM permissions are hand-scoped to only the `order-pool-*-ec2-role`/`-ec2-profile` resources `iam/01-ec2-instance-role.sh` creates, explicitly excluding the three OIDC deploy roles and the OIDC provider itself — granting a CI role broad IAM access is a well-known self-privilege-escalation path, so that's the one place "FullAccess" was never on the table.
 
-**Open question, not yet decided**: `backend/deploy-remote.sh.tmpl` lives in this repo, but the workflow that needs to render and send it will live in `order-pools-backend`. Either that workflow does a second, cross-repo `actions/checkout` of this repo (needs a fine-grained PAT — the default `GITHUB_TOKEN` can't read a different private repo), or the render-and-send-command logic gets duplicated directly into that workflow's YAML. Leaning toward the cross-repo checkout to keep this repo as the single source of truth for deployment mechanics, but not decided.
+**Workflows**, one per repo:
+
+- `order-pools-infrastructure/.github/workflows/infra.yml` — manual (`workflow_dispatch`), runs `deploy.sh`/`destroy.sh` against a chosen environment. No push trigger: infra changes are rare and higher-risk than app deploys.
+- `order-pools-backend/.github/workflows/deploy.yml` — builds and tests the app (own checkout, own `npm ci`/`npm test`/`npm run build`), packages the same no-`node_modules` tarball `deploy-backend.sh` does, uploads it to S3, then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` to do the actual render/SSM-send/poll mechanics.
+- `order-pools-app/.github/workflows/deploy.yml` — fully self-contained: build (with `VITE_API_BASE_URL` injected the same way `deploy-frontend.sh` does), `s3 sync` (two-pass cache headers), CloudFront invalidation, no cross-repo call.
+
+**Why the backend calls a reusable workflow but the frontend doesn't, even though both mirror a local script**: reusable workflows (`on: workflow_call`) are GitHub's sanctioned way to share workflow logic across private repos owned by the same account, without a PAT or deploy key — unlike a plain `actions/checkout` of a different repo, which the default `GITHUB_TOKEN` can never do regardless of ownership. The backend's deploy mechanics (render a template, send an SSM command, poll its status, poll target-group health) are substantial enough that duplicating them into `order-pools-backend`'s own workflow would be a real drift risk. The frontend's remaining logic after "build" is a handful of straightforward `aws s3`/`aws cloudfront` calls — small enough that the added indirection of a cross-repo call would cost more clarity than the duplication it avoids, which would cut against this project's own explicit "don't hide AWS CLI commands behind unnecessary abstraction" learning goal. Build itself (`npm ci`/`npm run build`) is inherently repo-local either way and was never a candidate for centralizing — it can only ever run where the app's own source is checked out.
+
+Each repo needs these set as **environment variables** (not secrets — none of these are sensitive) under Settings → Environments → `<env>` → Variables, printed at the end of `iam/02-github-oidc-roles.sh`'s output, or set directly with `gh variable set NAME --env <env> --body VALUE --repo <owner>/<repo>`:
+
+| Repo | Variables |
+|---|---|
+| `order-pools-infrastructure` | `INFRA_DEPLOY_ROLE_ARN`, `AWS_REGION` |
+| `order-pools-app` | `FRONTEND_DEPLOY_ROLE_ARN`, `AWS_REGION`, `BACKEND_DOMAIN` |
+| `order-pools-backend` | `BACKEND_DEPLOY_ROLE_ARN`, `AWS_REGION`, `BACKEND_PORT` |
+
+A GitHub Actions runner resolves AWS resource IDs exactly the way your laptop does — `aws ssm get-parameter --name /order-pool/<env>/state/backend/instance-id`, etc. — which is the entire reason those IDs live in SSM Parameter Store as the canonical copy (`lib/state.sh`) rather than only in a local, gitignored cache file a runner could never see.
+
+**Worth verifying empirically before relying on it for anything real** (noted honestly rather than asserted with more confidence than warranted): that same-account private-repo reusable-workflow calls work exactly as described here with zero extra configuration. This is documented GitHub behavior, but it's a comparatively less-common corner of Actions — Phase 7's end-to-end test should include a trivial dry run of the reusable-workflow call specifically, before trusting it for a real deploy.
 
 ## 10. Secrets
 
