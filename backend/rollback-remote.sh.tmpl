@@ -1,0 +1,36 @@
+#!/bin/bash
+# Runs on the EC2 instance via `aws ssm send-command`. Re-points
+# APP_ROOT/current at the release just before the current one and
+# restarts — the counterpart to deploy-remote.sh.tmpl's release install.
+set -Eeuo pipefail
+
+PROJECT="__PROJECT__"
+BACKEND_PORT="__BACKEND_PORT__"
+APP_ROOT="/opt/${PROJECT}-backend"
+SERVICE_NAME="${PROJECT}-backend"
+
+CURRENT_TARGET="$(readlink -f "${APP_ROOT}/current" || true)"
+echo "Current release: ${CURRENT_TARGET:-<none>}"
+
+# Every release directory is releases/<timestamp>/ — sorted newest
+# first, the first entry that ISN'T the current target is the previous
+# release deploy-backend.sh left in place (pruning keeps the 5 most
+# recent, so this is only unavailable if fewer than 2 deploys have ever
+# run).
+PREVIOUS_TARGET="$(ls -1dt "${APP_ROOT}"/releases/*/ 2>/dev/null | grep -vF "${CURRENT_TARGET}/" | head -n 1 || true)"
+[[ -n "$PREVIOUS_TARGET" ]] || { echo "No earlier release available to roll back to." >&2; exit 1; }
+PREVIOUS_TARGET="${PREVIOUS_TARGET%/}"
+
+echo "Rolling back to: ${PREVIOUS_TARGET}"
+ln -sfn "$PREVIOUS_TARGET" "${APP_ROOT}/current"
+systemctl restart "${SERVICE_NAME}"
+
+for i in $(seq 1 10); do
+  if curl -fsS "http://localhost:${BACKEND_PORT}/ping" >/dev/null; then
+    echo "Rollback health check passed."
+    exit 0
+  fi
+  sleep 3
+done
+echo "Health check FAILED after rollback — the instance may need manual investigation." >&2
+exit 1

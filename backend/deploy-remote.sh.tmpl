@@ -1,0 +1,73 @@
+#!/bin/bash
+# Runs on the EC2 instance via `aws ssm send-command` — never over SSH.
+# Placeholders are substituted by deploy-backend.sh before this is sent.
+set -Eeuo pipefail
+
+PROJECT="__PROJECT__"
+ENVIRONMENT="__ENVIRONMENT__"
+BACKEND_PORT="__BACKEND_PORT__"
+BUCKET="__ARTIFACT_BUCKET__"
+OBJECT_KEY="__ARTIFACT_KEY__"
+AWS_REGION="__AWS_REGION__"
+APP_ROOT="/opt/${PROJECT}-backend"
+SERVICE_NAME="${PROJECT}-backend"
+APP_USER="orderpool"
+RELEASE_ID="$(date -u +%Y%m%d%H%M%S)"
+RELEASE_DIR="${APP_ROOT}/releases/${RELEASE_ID}"
+
+echo "=== Deploying release ${RELEASE_ID} ==="
+
+echo "--- Downloading artifact from s3://${BUCKET}/${OBJECT_KEY} ---"
+mkdir -p "$RELEASE_DIR"
+aws s3 cp "s3://${BUCKET}/${OBJECT_KEY}" /tmp/release.tar.gz --region "$AWS_REGION"
+tar xzf /tmp/release.tar.gz -C "$RELEASE_DIR"
+rm -f /tmp/release.tar.gz
+
+echo "--- Installing production dependencies (npm ci, not a copied node_modules) ---"
+# The tarball built by deploy-backend.sh deliberately contains only
+# package.json/package-lock.json/dist/ — no node_modules. bcrypt is a
+# native addon; installing it HERE, on the same Ubuntu/x86_64 (or arm64)
+# instance that will run it, is what avoids shipping a macOS-built
+# binary that would crash the moment the process starts on Linux.
+(cd "$RELEASE_DIR" && npm ci --omit=dev)
+
+echo "--- Writing environment file from SSM Parameter Store ---"
+# Every parameter under /project/env/backend/ becomes one KEY=VALUE
+# line. Written to a temp file and moved into place atomically
+# (`mv` within the same filesystem is atomic) so nothing ever reads a
+# half-written env file.
+aws ssm get-parameters-by-path \
+  --path "/${PROJECT}/${ENVIRONMENT}/backend/" \
+  --with-decryption --region "$AWS_REGION" \
+  --query 'Parameters[]' --output json \
+  | jq -r '.[] | "\(.Name | split("/") | last)=\(.Value)"' > "${APP_ROOT}/shared/.env.new"
+mv "${APP_ROOT}/shared/.env.new" "${APP_ROOT}/shared/.env"
+chmod 600 "${APP_ROOT}/shared/.env"
+
+echo "--- Fixing ownership (app runs as ${APP_USER}, never root) ---"
+chown -R "${APP_USER}:${APP_USER}" "$RELEASE_DIR" "${APP_ROOT}/shared/.env"
+
+echo "--- Repointing 'current' (atomic symlink swap — this IS the deploy) ---"
+ln -sfn "$RELEASE_DIR" "${APP_ROOT}/current"
+
+echo "--- Restarting ${SERVICE_NAME} ---"
+systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+systemctl restart "${SERVICE_NAME}"
+
+echo "--- Waiting for the app to answer locally on :${BACKEND_PORT}/ping ---"
+for i in $(seq 1 10); do
+  if curl -fsS "http://localhost:${BACKEND_PORT}/ping" >/dev/null; then
+    echo "Health check passed."
+    break
+  fi
+  if [[ "$i" -eq 10 ]]; then
+    echo "Health check FAILED after 10 attempts — deployment did not come up healthy." >&2
+    exit 1
+  fi
+  sleep 3
+done
+
+echo "--- Pruning old releases (keeping the 5 most recent, for rollback) ---"
+ls -1dt "${APP_ROOT}"/releases/*/ 2>/dev/null | tail -n +6 | xargs -r rm -rf
+
+echo "=== Deployment of ${RELEASE_ID} complete ==="

@@ -1,0 +1,78 @@
+#!/bin/bash
+# Runs ONCE, as root, on first boot (cloud-init "user data"). Placeholders
+# like __NODE_MAJOR_VERSION__ are substituted by backend/01-ec2-instance.sh
+# before this is passed to `aws ec2 run-instances --user-data`.
+set -Eeuo pipefail
+exec > >(tee -a /var/log/order-pool-bootstrap.log) 2>&1
+echo "=== order-pool bootstrap starting: $(date -u) ==="
+
+APP_USER="orderpool"
+APP_ROOT="/opt/__PROJECT__-backend"
+SERVICE_NAME="__PROJECT__-backend"
+NODE_MAJOR_VERSION="__NODE_MAJOR_VERSION__"
+
+echo "--- Installing Node.js ${NODE_MAJOR_VERSION}.x via NodeSource ---"
+# NodeSource's setup script is the standard, reliable way to get a
+# specific Node major version onto Ubuntu without building from source
+# or relying on Ubuntu's own (often stale) distro package. The version
+# comes from config/<env>.env's NODE_MAJOR_VERSION, kept in sync with
+# order-pools-backend's own pinned Node version — not hardcoded here.
+apt-get update -y
+curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_VERSION}.x" | bash -
+apt-get install -y nodejs
+
+echo "--- Confirming the SSM Agent is running ---"
+# Canonical's official Ubuntu AMIs (the ones this project resolves via
+# the /aws/service/canonical/... SSM public parameter) ship the SSM
+# Agent pre-installed as a snap. This is what lets `aws ssm
+# send-command`/`start-session` reach the instance with zero inbound
+# ports open — no SSH, no bastion host.
+systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service || \
+  echo "WARNING: could not enable the snap SSM agent service — check manually via the SSM console."
+
+echo "--- Creating a dedicated, unprivileged app user and directories ---"
+# The application must never run as root: a compromised Express process
+# should only ever be able to touch its own release directory, nothing
+# else on the box.
+id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$APP_USER"
+mkdir -p "${APP_ROOT}/releases" "${APP_ROOT}/shared"
+chown -R "${APP_USER}:${APP_USER}" "$APP_ROOT"
+
+echo "--- Installing the systemd unit (not started yet — no release deployed) ---"
+# Release layout (populated by Phase 3's deploy-backend.sh, not here):
+#   APP_ROOT/releases/<timestamp>/   one directory per deployed build
+#   APP_ROOT/current -> releases/<timestamp>   symlink, atomically
+#                                               repointed on each deploy
+#                                               (enables instant rollback
+#                                               by repointing it back)
+#   APP_ROOT/shared/.env             secrets pulled from SSM Parameter
+#                                     Store at deploy time, never baked
+#                                     into the release or this script
+cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Order Pool backend (Express/TypeScript)
+After=network.target
+
+[Service]
+Type=simple
+User=${APP_USER}
+WorkingDirectory=${APP_ROOT}/current
+EnvironmentFile=${APP_ROOT}/shared/.env
+ExecStart=/usr/bin/node ${APP_ROOT}/current/dist/src/server.js
+Restart=on-failure
+RestartSec=5
+# order-pools-backend/src/server.ts only traps SIGINT to shut down
+# gracefully (closes the HTTP server + Mongo connection cleanly before
+# exiting) — it does not handle SIGTERM, systemd's default stop signal.
+# Rather than changing application code for an infrastructure concern,
+# systemd is told to send the signal the app already understands.
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+echo "=== order-pool bootstrap complete: $(date -u) ==="
+echo "${SERVICE_NAME} is installed but NOT enabled/started — run deploy-backend.sh (Phase 3) to ship a release and start it."

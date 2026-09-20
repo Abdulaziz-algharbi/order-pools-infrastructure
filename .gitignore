@@ -1,0 +1,21 @@
+# Local account pin + resource-ID cache — see lib/aws-guard.sh and
+# lib/state.sh. Neither should ever be committed: the pin file exists
+# specifically to protect against running an environment's scripts
+# against the wrong AWS account, and the outputs cache is a convenience
+# mirror of what's already in SSM Parameter Store, regenerable any time.
+config/*.local.env
+environments/*/outputs.env
+
+# Real secret values (Atlas URI with the real password, JWT secrets,
+# Thawani keys, SMTP creds) — filled in locally from
+# config/<env>.secrets.env.example, pushed to SSM Parameter Store by
+# backend/env-to-ssm.sh, and NEVER committed. Only the .example template
+# (with blank values) is tracked.
+config/*.secrets.env
+
+# Backend build artifacts staged locally before upload to S3
+backend/.build/
+
+# Anything generated locally while testing
+*.pem
+.DS_Store
