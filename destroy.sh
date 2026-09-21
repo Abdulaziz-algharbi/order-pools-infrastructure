@@ -149,7 +149,20 @@ fi
 TG_ARN="$(get_output "$ENVIRONMENT" backend/target-group-arn)"
 if [[ -n "$TG_ARN" && "$TG_ARN" != "None" ]] && aws elbv2 describe-target-groups --target-group-arns "$TG_ARN" >/dev/null 2>&1; then
   log_info "Deleting target group ${TG_ARN}..."
-  aws elbv2 delete-target-group --target-group-arn "$TG_ARN"
+  # delete-load-balancer above is asynchronous: the API call returns
+  # before the ALB's listener (and its reference to this target group)
+  # has actually finished tearing down in the background. The wait
+  # right above this can report the ALB itself gone from
+  # describe-load-balancers slightly before that listener linkage is
+  # fully released, so an immediate delete-target-group can still hit
+  # ResourceInUse for a few seconds. Same shape of race as the security
+  # group retry further down — retry instead of treating it as fatal.
+  for attempt in 1 2 3 4 5 6; do
+    aws elbv2 delete-target-group --target-group-arn "$TG_ARN" 2>/dev/null && break
+    [[ "$attempt" -eq 6 ]] && die "Could not delete target group ${TG_ARN} after 6 attempts — it may still be attached to a listener; check manually: aws elbv2 describe-target-groups --target-group-arns ${TG_ARN}"
+    log_info "Target group still in use by a listener — retrying in 5s (attempt ${attempt}/6)..."
+    sleep 5
+  done
 else
   log_warn "No target group found — skipping."
 fi
