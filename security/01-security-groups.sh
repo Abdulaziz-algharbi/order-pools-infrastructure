@@ -75,20 +75,34 @@ done
 #             CIDR-based rule exists at all — nothing on the open
 #             internet can reach port 8000 directly, only traffic that
 #             has already passed through the ALB.
-#   Outbound: ONLY 443/tcp to the internet (MongoDB Atlas, SSM control
-#             plane, apt/npm registries) plus DNS (UDP+TCP 53) scoped to
-#             the VPC CIDR — not the whole internet.
+#   Outbound: 443/tcp (HTTPS — SSM control plane, apt's NodeSource
+#             source, npm), 80/tcp (HTTP — Ubuntu's own default package
+#             archives, which real dependencies of the NodeSource nodejs
+#             .deb, e.g. libatomic1/gcc-14, pull from at bootstrap; apt
+#             verifies GPG-signed release indices regardless of
+#             transport, so HTTP-for-apt doesn't weaken package
+#             integrity), 27017/tcp (MongoDB's wire protocol — what a
+#             mongodb+srv:// connection to Atlas actually uses for data,
+#             as distinct from the DNS SRV/TXT lookup that discovers the
+#             hostnames in the first place), and DNS (UDP+TCP 53) scoped
+#             to the VPC CIDR — not the whole internet.
 #
-#   Why DNS egress is required for a "443-only" instance: a
-#   `mongodb+srv://` URI is resolved via a DNS SRV + TXT lookup, and
-#   every HTTPS connection needs a successful DNS lookup BEFORE the TLS
-#   handshake can even start. Without this rule, "outbound 443 only"
-#   would silently break everything, Atlas included, because nothing
+#   All four destination ports use 0.0.0.0/0, not a narrower CIDR:
+#   neither Ubuntu's package mirrors nor Atlas's cluster nodes publish a
+#   small, stable IP range a security group could pin instead, so a
+#   tighter CIDR here would be fragile without buying real protection —
+#   the actual security boundary for Atlas access is its own Network
+#   Access allow-list and DB user credentials, not this security group.
+#
+#   Why DNS egress is required at all: a `mongodb+srv://` URI is
+#   resolved via a DNS SRV + TXT lookup, and every HTTP/HTTPS connection
+#   needs a successful DNS lookup BEFORE the connection can even start.
+#   Without this rule none of the above would work, because nothing
 #   could resolve a hostname to connect to in the first place. Scoping
 #   it to VPC_CIDR (not 0.0.0.0/0) means it can only reach the VPC's own
 #   Route 53 Resolver, never an arbitrary DNS server on the internet.
 # =====================================================================
-EC2_SG_ID="$(find_or_create_sg "${PROJECT}-${ENVIRONMENT}-backend-sg" "Backend EC2 - ALB-only inbound, 443-only outbound")"
+EC2_SG_ID="$(find_or_create_sg "${PROJECT}-${ENVIRONMENT}-backend-sg" "Backend EC2 - ALB-only inbound, package-mgmt/Atlas/DNS outbound")"
 
 ALREADY_ALLOWED="$(aws ec2 describe-security-groups --group-ids "$EC2_SG_ID" \
   --query "length(SecurityGroups[0].IpPermissions[?ToPort==\`${BACKEND_PORT}\`])" --output text)"
@@ -117,15 +131,25 @@ else
   log_info "Default allow-all egress rule already absent — skipping revoke."
 fi
 
-HTTPS_EGRESS_PRESENT="$(aws ec2 describe-security-groups --group-ids "$EC2_SG_ID" \
-  --query "length(SecurityGroups[0].IpPermissionsEgress[?ToPort==\`443\` && IpProtocol=='tcp'])" --output text)"
-if [[ "$HTTPS_EGRESS_PRESENT" == "0" ]]; then
-  log_info "Allowing 443/tcp outbound to 0.0.0.0/0 (Atlas, SSM, apt, npm)..."
-  aws ec2 authorize-security-group-egress \
-    --group-id "$EC2_SG_ID" --protocol tcp --port 443 --cidr 0.0.0.0/0 >/dev/null
-else
-  log_info "443/tcp egress already present — skipping."
-fi
+# 443 = HTTPS (SSM, apt's NodeSource source, npm)
+# 80   = HTTP (Ubuntu's own default apt archives — required for real
+#        dependencies of packages installed at bootstrap, e.g. NodeSource's
+#        nodejs .deb pulling in libatomic1/gcc-14 from security.ubuntu.com)
+# 27017 = MongoDB wire protocol (the actual Atlas data connection —
+#         distinct from the DNS lookup that mongodb+srv:// uses to find it)
+for tcp_port_desc in "443:HTTPS (SSM, apt/npm)" "80:HTTP (Ubuntu package archives)" "27017:MongoDB wire protocol (Atlas)"; do
+  tcp_port="${tcp_port_desc%%:*}"
+  tcp_desc="${tcp_port_desc#*:}"
+  EGRESS_PRESENT="$(aws ec2 describe-security-groups --group-ids "$EC2_SG_ID" \
+    --query "length(SecurityGroups[0].IpPermissionsEgress[?ToPort==\`${tcp_port}\` && IpProtocol=='tcp'])" --output text)"
+  if [[ "$EGRESS_PRESENT" == "0" ]]; then
+    log_info "Allowing ${tcp_port}/tcp outbound to 0.0.0.0/0 (${tcp_desc})..."
+    aws ec2 authorize-security-group-egress \
+      --group-id "$EC2_SG_ID" --protocol tcp --port "$tcp_port" --cidr 0.0.0.0/0 >/dev/null
+  else
+    log_info "${tcp_port}/tcp egress already present — skipping."
+  fi
+done
 
 for proto in tcp udp; do
   DNS_EGRESS_PRESENT="$(aws ec2 describe-security-groups --group-ids "$EC2_SG_ID" \

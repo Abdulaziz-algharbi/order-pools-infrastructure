@@ -21,6 +21,15 @@ apt-get update -y
 curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_VERSION}.x" | bash -
 apt-get install -y nodejs
 
+# `set -e` already aborts this script the instant `apt-get install`
+# returns non-zero, so a hard package-manager failure can't reach this
+# point at all. This check is for the narrower, sneakier case: node/npm
+# ending up on PATH but non-functional (a partial/corrupt install that
+# still exits 0). Bootstrap must not report success in that case either.
+echo "--- Verifying the Node.js install ---"
+node --version || { echo "FATAL: node --version failed after install" >&2; exit 1; }
+npm --version || { echo "FATAL: npm --version failed after install" >&2; exit 1; }
+
 echo "--- Confirming the SSM Agent is running ---"
 # Canonical's official Ubuntu AMIs (the ones this project resolves via
 # the /aws/service/canonical/... SSM public parameter) ship the SSM
