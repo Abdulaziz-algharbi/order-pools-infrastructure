@@ -94,9 +94,12 @@ $EDITOR config/dev.secrets.env               # fill in the real Atlas password, 
 ./backend/deploy-backend.sh dev              # builds + ships order-pools-backend
 ./frontend/deploy-frontend.sh dev            # builds + ships order-pools-app
 ./status.sh dev                              # live health check of everything above
+./test/verify-dev.sh dev                     # pass/fail assertions — see below
 ```
 
 `deploy.sh` deliberately stops after infrastructure — it never builds or ships application code itself (see [GitHub Actions](#9-github-actions) for why that split matters).
+
+`test/verify-dev.sh` is read-only, like `status.sh`, but asserts explicit pass/fail per resource (existence, key config values, live HTTP checks) instead of just printing state — the closest thing this plain-bash toolkit has to a test suite, and a substitute for re-clicking through every AWS console page by hand after a change. Exits non-zero and lists every failure if anything's wrong.
 
 If you also want GitHub Actions able to deploy this environment, run `./iam/02-github-oidc-roles.sh dev` once as well (not part of `deploy.sh`'s sequence — setting up CI trust roles is a deliberate, separate action, not something that should happen silently every time you provision infrastructure) and set the resulting role ARNs as GitHub environment variables per [GitHub Actions](#9-github-actions).
 
