@@ -30,6 +30,22 @@ echo "--- Verifying the Node.js install ---"
 node --version || { echo "FATAL: node --version failed after install" >&2; exit 1; }
 npm --version || { echo "FATAL: npm --version failed after install" >&2; exit 1; }
 
+echo "--- Installing the AWS CLI v2 and jq ---"
+# The SSM Agent (which lets `aws ssm send-command` reach this instance
+# at all) is a separate, statically-compiled binary with no relation to
+# the `aws` CLI tool — neither it nor Ubuntu's stock image includes the
+# CLI. deploy-remote.sh.tmpl needs both `aws` (s3 cp, ssm
+# get-parameters-by-path) and `jq` (parsing that command's JSON output
+# into .env lines) to run at all, so both are installed explicitly here
+# rather than assumed present.
+apt-get install -y unzip jq
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/awscliv2.zip /tmp/aws
+aws --version || { echo "FATAL: aws --version failed after install" >&2; exit 1; }
+jq --version || { echo "FATAL: jq --version failed after install" >&2; exit 1; }
+
 echo "--- Confirming the SSM Agent is running ---"
 # Canonical's official Ubuntu AMIs (the ones this project resolves via
 # the /aws/service/canonical/... SSM public parameter) ship the SSM
