@@ -137,34 +137,35 @@ This is **pull-based**: the instance always initiates the S3 download and the pa
 Implemented (Phase 6). `iam/02-github-oidc-roles.sh <env>` creates one OIDC identity provider (account-wide, once) and three separate IAM roles, each trusted only by its own repo + this specific environment (via the token's `repository`/`environment` claims, not long-lived AWS access keys):
 
 ```text
-order-pool-<env>-infra-deploy      -> broad (creates/destroys the whole stack); trusted by order-pools-infrastructure
+order-pool-<env>-infra-deploy      -> broad (could create/destroy the whole stack); provisioned but
+                                       DELIBERATELY not used by any workflow — see below
 order-pool-<env>-frontend-deploy   -> scoped to the frontend S3 bucket + CreateInvalidation; trusted by order-pools-app
 order-pool-<env>-backend-deploy    -> scoped to the artifact bucket + ssm:SendCommand on Project/Environment-tagged
                                        instances + read of /order-pool/<env>/state/backend/* and .../backend/*;
                                        trusted by order-pools-backend
 ```
 
-The `infra-deploy` role uses AWS managed "FullAccess" policies for the services it provisions (EC2/ELB/S3/CloudFront/Route53/ACM/SSM) — a deliberate simplification for this project's scale, documented as such rather than silently glossed over. IAM itself is the one exception: `infra-deploy`'s IAM permissions are hand-scoped to only the `order-pool-*-ec2-role`/`-ec2-profile` resources `iam/01-ec2-instance-role.sh` creates, explicitly excluding the three OIDC deploy roles and the OIDC provider itself — granting a CI role broad IAM access is a well-known self-privilege-escalation path, so that's the one place "FullAccess" was never on the table.
+**Infrastructure provisioning stays manual, on purpose — no `infra.yml` workflow exists.** `deploy.sh`/`destroy.sh` are run by a human, from a terminal, with that person's own AWS credentials and judgment in the loop. This was a deliberate call, not an oversight: application CI/CD (below) solves a real, recurring problem — app code changes often, and each deploy is a fast, low-risk, repeatable operation that should just happen on push. Infra doesn't have that shape. VPC/IAM/security-group/ALB changes are infrequent and high-blast-radius, not a "ship many times a day" workflow, and `infra-deploy` is by far the most privileged of the three roles — handing that much power to a CI pipeline triggerable by anything with push access is a materially bigger security surface than a human running it themselves, with the ability to Ctrl-C mid-`destroy.sh`. There's also no multi-person coordination problem here to justify it (solo project) — that's the actual scenario where infra-via-CI would earn its complexity. `iam/02-github-oidc-roles.sh` still provisions the `infra-deploy` role (harmless, unused, and cheap to keep around if a future team-scale need for it ever materializes), it's just never assumed by anything today.
 
-**Workflows**, one per repo:
+**Workflows**, one per app repo (deliberately none in `order-pools-infrastructure` itself):
 
-- `order-pools-infrastructure/.github/workflows/infra.yml` — manual (`workflow_dispatch`), runs `deploy.sh`/`destroy.sh` against a chosen environment. No push trigger: infra changes are rare and higher-risk than app deploys.
 - `order-pools-backend/.github/workflows/deploy.yml` — builds and tests the app (own checkout, own `npm ci`/`npm test`/`npm run build`), packages the same no-`node_modules` tarball `deploy-backend.sh` does, uploads it to S3, then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` to do the actual render/SSM-send/poll mechanics.
 - `order-pools-app/.github/workflows/deploy.yml` — fully self-contained: build (with `VITE_API_BASE_URL` injected the same way `deploy-frontend.sh` does), `s3 sync` (two-pass cache headers), CloudFront invalidation, no cross-repo call.
 
-**Why the backend calls a reusable workflow but the frontend doesn't, even though both mirror a local script**: reusable workflows (`on: workflow_call`) are GitHub's sanctioned way to share workflow logic across private repos owned by the same account, without a PAT or deploy key — unlike a plain `actions/checkout` of a different repo, which the default `GITHUB_TOKEN` can never do regardless of ownership. The backend's deploy mechanics (render a template, send an SSM command, poll its status, poll target-group health) are substantial enough that duplicating them into `order-pools-backend`'s own workflow would be a real drift risk. The frontend's remaining logic after "build" is a handful of straightforward `aws s3`/`aws cloudfront` calls — small enough that the added indirection of a cross-repo call would cost more clarity than the duplication it avoids, which would cut against this project's own explicit "don't hide AWS CLI commands behind unnecessary abstraction" learning goal. Build itself (`npm ci`/`npm run build`) is inherently repo-local either way and was never a candidate for centralizing — it can only ever run where the app's own source is checked out.
+Both trigger on **push to `main`** (real continuous deployment) as well as manual `workflow_dispatch`, and both are confirmed working end-to-end against the live `dev` environment.
+
+**Why the backend calls a reusable workflow but the frontend doesn't, even though both mirror a local script**: reusable workflows (`on: workflow_call`) are GitHub's sanctioned way to share workflow logic across repos without a PAT or deploy key — unlike a plain `actions/checkout` of a different repo, which the default `GITHUB_TOKEN` cannot do for a private repo regardless of ownership (confirmed live: this is *why* `order-pools-infrastructure` is public — a called reusable workflow's own `checkout` step needs to read its own repo's files, e.g. `deploy-remote.sh.tmpl`, and that specifically requires the repo to be public or a PAT to be introduced; made public since nothing secret lives in it). The backend's deploy mechanics (render a template, send an SSM command, poll its status, poll target-group health) are substantial enough that duplicating them into `order-pools-backend`'s own workflow would be a real drift risk. The frontend's remaining logic after "build" is a handful of straightforward `aws s3`/`aws cloudfront` calls — small enough that the added indirection of a cross-repo call would cost more clarity than the duplication it avoids, which would cut against this project's own explicit "don't hide AWS CLI commands behind unnecessary abstraction" learning goal. Build itself (`npm ci`/`npm run build`) is inherently repo-local either way and was never a candidate for centralizing — it can only ever run where the app's own source is checked out.
+
+Also required for the reusable-workflow call specifically: `order-pools-infrastructure`'s repo-level Actions "access" setting must allow calls from other repos owned by the same account (Settings → Actions → General → Access — defaults to "Not accessible", confirmed live) — separate from, and in addition to, the repo being public.
 
 Each repo needs these set as **environment variables** (not secrets — none of these are sensitive) under Settings → Environments → `<env>` → Variables, printed at the end of `iam/02-github-oidc-roles.sh`'s output, or set directly with `gh variable set NAME --env <env> --body VALUE --repo <owner>/<repo>`:
 
 | Repo | Variables |
 |---|---|
-| `order-pools-infrastructure` | `INFRA_DEPLOY_ROLE_ARN`, `AWS_REGION` |
 | `order-pools-app` | `FRONTEND_DEPLOY_ROLE_ARN`, `AWS_REGION`, `BACKEND_DOMAIN` |
 | `order-pools-backend` | `BACKEND_DEPLOY_ROLE_ARN`, `AWS_REGION`, `BACKEND_PORT` |
 
 A GitHub Actions runner resolves AWS resource IDs exactly the way your laptop does — `aws ssm get-parameter --name /order-pool/<env>/state/backend/instance-id`, etc. — which is the entire reason those IDs live in SSM Parameter Store as the canonical copy (`lib/state.sh`) rather than only in a local, gitignored cache file a runner could never see.
-
-**Worth verifying empirically before relying on it for anything real** (noted honestly rather than asserted with more confidence than warranted): that same-account private-repo reusable-workflow calls work exactly as described here with zero extra configuration. This is documented GitHub behavior, but it's a comparatively less-common corner of Actions — Phase 7's end-to-end test should include a trivial dry run of the reusable-workflow call specifically, before trusting it for a real deploy.
 
 ## 10. Secrets
 
