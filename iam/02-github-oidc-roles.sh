@@ -95,18 +95,27 @@ put_policy() {
 # AWS's IAM API rejects a GitHub OIDC trust policy outright
 # (MalformedPolicyDocument) unless its Condition references `sub` or
 # `job_workflow_ref` via StringEquals/StringLike — conditioning only on
-# other claims like `repository`/`environment` (which is what this
-# function originally did) is refused server-side, specifically because
-# AWS has seen too many overly-loose GitHub OIDC trust policies that
-# only checked `aud`. For a job with `environment: <env>` set, GitHub's
-# documented `sub` format is exactly `repo:<owner>/<repo>:environment:<env>`
-# — built directly from the same two inputs already used for the
-# (still-included, now redundant-but-harmless) repository/environment
-# checks below.
+# other claims like `repository`/`environment` is refused server-side,
+# specifically because AWS has seen too many overly-loose GitHub OIDC
+# trust policies that only checked `aud`.
+#
+# The `sub` claim's actual current format (confirmed by decoding a real
+# token from a live run, not from documentation — GitHub has changed
+# this before and may again) embeds numeric owner/repo IDs:
+#   repo:<owner>@<owner_id>/<repo>@<repo_id>:environment:<env>
+# e.g. repo:Abdulaziz-algharbi@158807579/order-pools-app@1347144032:environment:dev
+# An earlier version of this script used StringEquals with the simpler
+# `repo:<owner>/<repo>:environment:<env>` form some older docs describe
+# — that value never matched the real claim, so
+# sts:AssumeRoleWithWebIdentity was rejected outright even though the
+# separate repository/environment checks below were individually
+# correct (StringEquals requires every key in the block to match).
+# StringLike with the numeric-ID portions wildcarded is what actually
+# matches today, while still only matching this exact owner and repo.
 trust_policy_for() {
   local repo="$1"
   jq -n --arg oidcArn "$OIDC_PROVIDER_ARN" --arg repo "${GITHUB_OWNER}/${repo}" --arg env "$ENVIRONMENT" \
-    --arg sub "repo:${GITHUB_OWNER}/${repo}:environment:${ENVIRONMENT}" '{
+    --arg subLike "repo:${GITHUB_OWNER}@*/${repo}@*:environment:${ENVIRONMENT}" '{
     Version: "2012-10-17",
     Statement: [{
       Effect: "Allow",
@@ -115,9 +124,11 @@ trust_policy_for() {
       Condition: {
         StringEquals: {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          "token.actions.githubusercontent.com:sub": $sub,
           "token.actions.githubusercontent.com:repository": $repo,
           "token.actions.githubusercontent.com:environment": $env
+        },
+        StringLike: {
+          "token.actions.githubusercontent.com:sub": $subLike
         }
       }
     }]
