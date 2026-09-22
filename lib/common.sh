@@ -3,6 +3,19 @@
 # This file is never executed directly — only `source`d — so it doesn't
 # get its own shebang-executed `set -Eeuo pipefail`; each caller sets
 # that itself before sourcing this.
+#
+# PORTABILITY CONSTRAINT, for anything added to this toolkit later:
+# stick to bash 3.2 features. Every script here uses
+# `#!/usr/bin/env bash`, and macOS still ships bash 3.2.57 as /bin/bash
+# (frozen in 2007 over GPLv3), which commonly sits AHEAD of Homebrew's
+# modern bash on PATH — so the shebang can resolve to 3.2 even on a
+# machine with bash 5 installed. That's not hypothetical: a `mapfile`
+# call in network/02-subnets.sh failed exactly this way when deploy.sh
+# spawned it as a child process. Avoid bash 4+ constructs —
+# `mapfile`/`readarray` (use a `while IFS= read -r` loop), associative
+# arrays (`declare -A`), `${var,,}`/`${var^^}` case conversion (use
+# `tr`), and namerefs (`local -n`). GitHub Actions runners have bash 5,
+# so CI will not catch a regression here; macOS is the constraint.
 
 # --- logging -------------------------------------------------------
 # Colors are skipped when stdout isn't a terminal (e.g. a GitHub Actions

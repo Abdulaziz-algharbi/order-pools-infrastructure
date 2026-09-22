@@ -38,7 +38,19 @@ VPC_ID="$(get_output "$ENVIRONMENT" network/vpc-id)"
 # asks AWS which AZs exist for the configured region and picks the
 # first two, alphabetically, for determinism across re-runs.
 log_info "Resolving Availability Zones for region ${AWS_REGION}..."
-mapfile -t AVAILABILITY_ZONES < <(aws ec2 describe-availability-zones \
+# Read with a `while read` loop rather than `mapfile`/`readarray`:
+# those are bash 4.0+ builtins, and macOS still ships bash 3.2.57 as
+# /bin/bash (frozen in 2007 over GPLv3). Since these scripts use
+# `#!/usr/bin/env bash`, a Mac with /bin ahead of /opt/homebrew/bin on
+# PATH resolves the shebang to that 3.2 — so `mapfile` here failed with
+# "command not found" when deploy.sh spawned this script, even on a
+# machine with bash 5 installed. Array `+=` and process substitution
+# both work fine in 3.2, so this loop is portable to every bash the
+# shebang can plausibly resolve to.
+AVAILABILITY_ZONES=()
+while IFS= read -r az; do
+  AVAILABILITY_ZONES+=("$az")
+done < <(aws ec2 describe-availability-zones \
   --filters "Name=region-name,Values=${AWS_REGION}" "Name=zone-type,Values=availability-zone" \
   --query 'AvailabilityZones[].ZoneName' --output text | tr '\t' '\n' | sort | head -n 2)
 
