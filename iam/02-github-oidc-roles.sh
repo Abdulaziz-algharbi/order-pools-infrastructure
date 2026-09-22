@@ -293,7 +293,12 @@ BACKEND_POLICY=$(jq -n \
       {
         Sid: "CheckTargetHealth",
         Effect: "Allow",
-        Action: ["elbv2:DescribeTargetHealth"],
+        # "elbv2" is the AWS CLI service name (aws elbv2
+        # describe-target-health) — the actual IAM action namespace for
+        # both Classic ELB and ELBv2 is elasticloadbalancing, confirmed
+        # live (AccessDenied on elbv2:DescribeTargetHealth — that
+        # action name does not exist in IAM at all).
+        Action: ["elasticloadbalancing:DescribeTargetHealth"],
         Resource: "*"
       }
     ]
