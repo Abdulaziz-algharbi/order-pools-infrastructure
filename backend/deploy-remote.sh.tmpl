@@ -55,13 +55,23 @@ systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
 systemctl restart "${SERVICE_NAME}"
 
 echo "--- Waiting for the app to answer locally on :${BACKEND_PORT}/ping ---"
-for i in $(seq 1 10); do
+# 30 attempts * 3s = ~90s. order-pools-backend/src/server.ts starts the
+# HTTP server only AFTER its MongoDB connection attempt settles (it
+# doesn't block on success, but it does wait for the promise to either
+# resolve or reject first) — and Mongoose's default connection timeout
+# is 30s. A budget close to 30s here is a near-tie against that timeout:
+# any time Atlas is briefly unreachable (a fresh instance's IP not yet
+# in Atlas's Network Access list, a transient blip, ...), the health
+# check loses the race and wrongly reports the deploy as failed even
+# though the app comes up fine a few seconds later. 90s gives real
+# margin above the 30s worst case.
+for i in $(seq 1 30); do
   if curl -fsS "http://localhost:${BACKEND_PORT}/ping" >/dev/null; then
     echo "Health check passed."
     break
   fi
-  if [[ "$i" -eq 10 ]]; then
-    echo "Health check FAILED after 10 attempts — deployment did not come up healthy." >&2
+  if [[ "$i" -eq 30 ]]; then
+    echo "Health check FAILED after 30 attempts (~90s) — deployment did not come up healthy." >&2
     exit 1
   fi
   sleep 3

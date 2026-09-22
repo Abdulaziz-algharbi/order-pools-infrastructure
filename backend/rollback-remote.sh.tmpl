@@ -25,12 +25,16 @@ echo "Rolling back to: ${PREVIOUS_TARGET}"
 ln -sfn "$PREVIOUS_TARGET" "${APP_ROOT}/current"
 systemctl restart "${SERVICE_NAME}"
 
-for i in $(seq 1 10); do
+# 30 attempts * 3s = ~90s — see deploy-remote.sh.tmpl for why: the app
+# only binds its HTTP port after its MongoDB connection attempt settles
+# (Mongoose's default timeout is 30s), so a shorter budget can lose that
+# race and report a healthy rollback as failed.
+for _ in $(seq 1 30); do
   if curl -fsS "http://localhost:${BACKEND_PORT}/ping" >/dev/null; then
     echo "Rollback health check passed."
     exit 0
   fi
   sleep 3
 done
-echo "Health check FAILED after rollback — the instance may need manual investigation." >&2
+echo "Health check FAILED after rollback (~90s) — the instance may need manual investigation." >&2
 exit 1
