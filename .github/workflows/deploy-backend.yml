@@ -98,10 +98,18 @@ jobs:
         run: |
           set -Eeuo pipefail
           COMMANDS_JSON=$(jq -n --arg script "$(cat /tmp/deploy-remote.sh)" '{commands: [$script]}')
+          # aws ssm send-command --comment has a hard 100-char limit
+          # (ValidationException, confirmed live) — the full 40-char
+          # commit SHA alone was enough to blow past it combined with
+          # the rest of the text, which is why this never showed up in
+          # backend/deploy-backend.sh's local runs (its comment is much
+          # shorter). Bash substring expansion on GITHUB_SHA for a short
+          # SHA instead of the ${{ github.sha }} YAML expression, which
+          # has no built-in way to truncate it.
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ steps.resolve.outputs.instance_id }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "order-pool ${{ inputs.environment }} backend deploy (GitHub Actions run ${{ github.run_id }}, ${{ github.sha }})" \
+            --comment "order-pool ${{ inputs.environment }} backend deploy (run ${{ github.run_id }}, ${GITHUB_SHA:0:7})" \
             --parameters "$COMMANDS_JSON" \
             --query 'Command.CommandId' --output text)
           echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"

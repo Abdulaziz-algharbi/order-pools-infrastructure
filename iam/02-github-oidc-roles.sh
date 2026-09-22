@@ -270,13 +270,19 @@ BACKEND_POLICY=$(jq -n \
         Resource: $stateArn
       },
       {
-        Sid: "SendDeployCommand",
+        Sid: "SendDeployCommandToTaggedInstances",
         Effect: "Allow",
         Action: ["ssm:SendCommand"],
-        Resource: ["arn:aws:ec2:*:*:instance/*", $documentArn],
+        Resource: "arn:aws:ec2:*:*:instance/*",
         Condition: {
           StringEquals: { "ssm:resourceTag/Project": "order-pool", "ssm:resourceTag/Environment": "ENV_PLACEHOLDER" }
         }
+      },
+      {
+        Sid: "SendDeployCommandUsingDocument",
+        Effect: "Allow",
+        Action: ["ssm:SendCommand"],
+        Resource: $documentArn
       },
       {
         Sid: "ReadCommandResults",
@@ -292,12 +298,20 @@ BACKEND_POLICY=$(jq -n \
       }
     ]
   }' | sed "s/ENV_PLACEHOLDER/${ENVIRONMENT}/")
-# Notes on two statements above:
-#  - The `ssm:resourceTag/...` condition restricts SendCommand to EC2
-#    instances tagged Project=order-pool, Environment=<this env> — the
-#    exact tags every instance this project creates already carries
-#    (see lib/common.sh's tag_spec) — rather than a specific instance
-#    ARN, which would break the moment an instance is replaced.
+# Notes on the statements above:
+#  - ssm:SendCommand needed two SEPARATE statements, not one with both
+#    resources in its Resource array — confirmed live, the combined
+#    form was denied. SendCommand touches both the target instance AND
+#    the document in one call, and IAM requires a statement's Condition
+#    to hold for every resource it covers. The `ssm:resourceTag/...`
+#    condition is meaningful for the EC2 instance (tagged
+#    Project=order-pool, Environment=<this env> — see lib/common.sh's
+#    tag_spec — rather than a specific instance ARN, which would break
+#    the moment an instance is replaced) but AWS-RunShellScript is a
+#    shared, AWS-owned document with no tags of that kind at all, so
+#    the same condition can never be satisfied for it — which sank the
+#    entire statement, including the instance half, when both resources
+#    shared one Condition block.
 #  - GetCommandInvocation/DescribeTargetHealth don't support resource-
 #    level restriction to a single command ID or target group the way
 #    S3/SSM-parameter actions do, so Resource is "*" for those two —
