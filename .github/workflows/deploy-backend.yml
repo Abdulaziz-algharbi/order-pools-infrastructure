@@ -44,7 +44,19 @@ jobs:
     environment: ${{ inputs.environment }}
     steps:
       - name: Checkout infrastructure (for deploy-remote.sh.tmpl)
+        # `repository:` must be explicit here. actions/checkout@v4's
+        # default (no `repository:` given) resolves `${{ github.repository }}`,
+        # and inside a job that belongs to a CALLED reusable workflow,
+        # that context reflects the CALLER's repo (order-pools-backend),
+        # not the repo this workflow file itself lives in — confirmed
+        # live: an earlier run without this checked out order-pools-backend
+        # by default, which has no backend/deploy-remote.sh.tmpl at all,
+        # so the render step failed with "no such file". This is a real,
+        # non-obvious quirk of reusable workflows, not documentation
+        # guesswork.
         uses: actions/checkout@v4
+        with:
+          repository: Abdulaziz-algharbi/order-pools-infrastructure
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
