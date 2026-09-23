@@ -47,6 +47,19 @@ chmod 600 "${APP_ROOT}/shared/.env"
 echo "--- Fixing ownership (app runs as ${APP_USER}, never root) ---"
 chown -R "${APP_USER}:${APP_USER}" "$RELEASE_DIR" "${APP_ROOT}/shared/.env"
 
+echo "--- Seeding the two predefined admin accounts (idempotent, check-and-create) ---"
+# order-pools-backend/scripts/seed-admins.ts does a findOne-then-create
+# per admin (skips ones that already exist), so it's safe to run on
+# every deploy rather than only once. Deliberately NOT called from
+# server.ts's boot path instead: that would re-run it on every systemd
+# Restart=on-failure crash-loop, not just once per real deploy. Runs
+# before the symlink swap/restart below so a seed failure leaves the
+# previous good release running rather than restarting into a half-done
+# state. Runs as APP_USER, same as the app itself, never as root; env
+# comes from the same shared/.env this deploy just wrote (includes the
+# SEED_ADMIN_* keys pushed via infrastructure/backend/env-to-ssm.sh).
+sudo -u "$APP_USER" bash -c "set -a; source '${APP_ROOT}/shared/.env'; set +a; node '${RELEASE_DIR}/dist/scripts/seed-admins.js'"
+
 echo "--- Repointing 'current' (atomic symlink swap — this IS the deploy) ---"
 ln -sfn "$RELEASE_DIR" "${APP_ROOT}/current"
 
