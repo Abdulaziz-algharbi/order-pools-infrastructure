@@ -33,7 +33,7 @@ log_warn "This will PERMANENTLY destroy every AWS resource this project created 
 log_warn "  VPC, subnets, Internet Gateway, route table, security groups,"
 log_warn "  IAM role/instance profile, EC2 instance, ALB + target group,"
 log_warn "  ACM certificates, Route 53 records, S3 buckets (emptied first),"
-log_warn "  CloudFront distribution."
+log_warn "  CloudFront distribution, SES SMTP IAM user/group."
 log_warn "This cannot be undone."
 echo
 read -r -p "Type the environment name ('${ENVIRONMENT}') to confirm: " CONFIRM_REPLY
@@ -211,6 +211,37 @@ if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
 else
   log_warn "Role ${ROLE_NAME} not found — skipping."
 fi
+echo
+
+log_info "--- Email: SES SMTP IAM user and group ---"
+# Only the environment-scoped sending credentials are removed. The SES
+# domain identity (${SES_DOMAIN:-<unset>}) and its DKIM/MAIL FROM/DMARC DNS
+# records are deliberately LEFT: an identity belongs to the account +
+# region, not to an environment — another environment sending from the
+# same domain would silently stop working if this deleted it. It costs
+# nothing to keep. To remove it for good, by hand:
+#   aws sesv2 delete-email-identity --email-identity <domain>
+#   (then delete its _domainkey CNAMEs and MAIL FROM MX/TXT in Route 53)
+SES_SMTP_USER="${PROJECT}-${ENVIRONMENT}-ses-smtp"
+SES_SENDERS_GROUP="${PROJECT}-${ENVIRONMENT}-ses-senders"
+if aws iam get-user --user-name "$SES_SMTP_USER" >/dev/null 2>&1; then
+  log_info "Deleting access keys, group membership and IAM user ${SES_SMTP_USER}..."
+  for key_id in $(aws iam list-access-keys --user-name "$SES_SMTP_USER" --query 'AccessKeyMetadata[].AccessKeyId' --output text); do
+    aws iam delete-access-key --user-name "$SES_SMTP_USER" --access-key-id "$key_id"
+  done
+  aws iam remove-user-from-group --user-name "$SES_SMTP_USER" --group-name "$SES_SENDERS_GROUP" 2>/dev/null || true
+  aws iam delete-user --user-name "$SES_SMTP_USER"
+else
+  log_warn "SES SMTP user ${SES_SMTP_USER} not found — skipping."
+fi
+if aws iam get-group --group-name "$SES_SENDERS_GROUP" >/dev/null 2>&1; then
+  log_info "Deleting IAM group ${SES_SENDERS_GROUP}..."
+  aws iam delete-group-policy --group-name "$SES_SENDERS_GROUP" --policy-name "${PROJECT}-${ENVIRONMENT}-ses-send" 2>/dev/null || true
+  aws iam delete-group --group-name "$SES_SENDERS_GROUP"
+else
+  log_warn "SES senders group ${SES_SENDERS_GROUP} not found — skipping."
+fi
+log_info "SES domain identity ${SES_DOMAIN:-<unset>} left in place (shared per account+region — see comment above)."
 echo
 
 log_info "--- Security groups ---"

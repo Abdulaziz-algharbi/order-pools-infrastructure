@@ -117,7 +117,7 @@ if [[ -n "$BACKEND_SG_ID" && "$BACKEND_SG_ID" != "None" ]]; then
   SSH_RULE="$(aws ec2 describe-security-groups --group-ids "$BACKEND_SG_ID" --query "length(SecurityGroups[0].IpPermissions[?ToPort==\`22\`])" --output text 2>/dev/null || echo "0")"
   check_eq "Backend SG has NO SSH (22) ingress rule" "$SSH_RULE" "0"
 
-  for port in 443 80 27017; do
+  for port in 443 80 27017 587; do
     EGRESS="$(aws ec2 describe-security-groups --group-ids "$BACKEND_SG_ID" --query "length(SecurityGroups[0].IpPermissionsEgress[?ToPort==\`${port}\` && IpProtocol=='tcp'])" --output text 2>/dev/null || echo "0")"
     check_eq "Backend SG egress allows ${port}/tcp" "$EGRESS" "1"
   done
@@ -262,6 +262,23 @@ for role_suffix in infra-deploy frontend-deploy backend-deploy; do
     fail "IAM role missing (${role_name})"
   fi
 done
+
+echo
+log_info "=== Email (AWS SES — email/01-ses.sh) ==="
+SES_JSON="$(aws sesv2 get-email-identity --email-identity "$SES_DOMAIN" --output json 2>/dev/null || echo '{}')"
+check_eq "SES domain ${SES_DOMAIN} verified for sending" "$(jq -r '.VerifiedForSendingStatus // "missing"' <<<"$SES_JSON")" "true"
+check_eq "SES DKIM status" "$(jq -r '.DkimAttributes.Status // "missing"' <<<"$SES_JSON")" "SUCCESS"
+check_eq "SES custom MAIL FROM (${SES_MAIL_FROM_DOMAIN}) status" "$(jq -r '.MailFromAttributes.MailFromDomainStatus // "missing"' <<<"$SES_JSON")" "SUCCESS"
+SES_SMTP_USER="${PROJECT}-${ENVIRONMENT}-ses-smtp"
+if aws iam get-user --user-name "$SES_SMTP_USER" >/dev/null 2>&1; then pass "SES SMTP IAM user exists (${SES_SMTP_USER})"; else fail "SES SMTP IAM user missing (${SES_SMTP_USER})"; fi
+SMTP_HOST_PARAM="$(aws ssm get-parameter --name "/${PROJECT}/${ENVIRONMENT}/backend/SMTP_HOST" --with-decryption --query 'Parameter.Value' --output text 2>/dev/null || echo "missing")"
+check_eq "Backend SMTP_HOST points at this region's SES endpoint" "$SMTP_HOST_PARAM" "email-smtp.${AWS_REGION}.amazonaws.com"
+# Informational only — the sandbox is a legitimate state while testing.
+if [[ "$(aws sesv2 get-account --query 'ProductionAccessEnabled' --output text 2>/dev/null)" == "True" ]]; then
+  pass "SES production access enabled"
+else
+  log_warn "SES account is still in the SANDBOX — only verified recipients get email (./email/02-ses-production-access.sh ${ENVIRONMENT})."
+fi
 
 echo
 log_info "=========================================="

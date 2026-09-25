@@ -84,12 +84,16 @@ done
 #             integrity), 27017/tcp (MongoDB's wire protocol — what a
 #             mongodb+srv:// connection to Atlas actually uses for data,
 #             as distinct from the DNS SRV/TXT lookup that discovers the
-#             hostnames in the first place), and DNS (UDP+TCP 53) scoped
-#             to the VPC CIDR — not the whole internet.
+#             hostnames in the first place), 587/tcp (SMTP submission
+#             with STARTTLS — how the backend hands outgoing email, e.g.
+#             email-verification links, to AWS SES's SMTP endpoint), and
+#             DNS (UDP+TCP 53) scoped to the VPC CIDR — not the whole
+#             internet.
 #
-#   All four destination ports use 0.0.0.0/0, not a narrower CIDR:
-#   neither Ubuntu's package mirrors nor Atlas's cluster nodes publish a
-#   small, stable IP range a security group could pin instead, so a
+#   All four TCP destination ports use 0.0.0.0/0, not a narrower CIDR:
+#   neither Ubuntu's package mirrors, Atlas's cluster nodes, nor SES's
+#   SMTP endpoint publish a small, stable IP range a security group could
+#   pin instead, so a
 #   tighter CIDR here would be fragile without buying real protection —
 #   the actual security boundary for Atlas access is its own Network
 #   Access allow-list and DB user credentials, not this security group.
@@ -137,7 +141,13 @@ fi
 #        nodejs .deb pulling in libatomic1/gcc-14 from security.ubuntu.com)
 # 27017 = MongoDB wire protocol (the actual Atlas data connection —
 #         distinct from the DNS lookup that mongodb+srv:// uses to find it)
-for tcp_port_desc in "443:HTTPS (SSM, apt/npm)" "80:HTTP (Ubuntu package archives)" "27017:MongoDB wire protocol (Atlas)"; do
+# 587  = SMTP submission, upgraded to TLS via STARTTLS — AWS SES's SMTP
+#        endpoint (email-smtp.<region>.amazonaws.com). Not 25: AWS
+#        throttles outbound port 25 from EC2 by default, and 587 is the
+#        standard port for an authenticated client submitting mail.
+#        Credentials are never sent before STARTTLS completes (SES
+#        refuses AUTH on an unencrypted connection).
+for tcp_port_desc in "443:HTTPS (SSM, apt/npm)" "80:HTTP (Ubuntu package archives)" "27017:MongoDB wire protocol (Atlas)" "587:SMTP submission (AWS SES)"; do
   tcp_port="${tcp_port_desc%%:*}"
   tcp_desc="${tcp_port_desc#*:}"
   EGRESS_PRESENT="$(aws ec2 describe-security-groups --group-ids "$EC2_SG_ID" \

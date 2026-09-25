@@ -116,6 +116,19 @@ else
   row "Frontend ACM certificate" "<none>"
 fi
 
+section "Email (AWS SES)"
+SES_JSON="$(aws sesv2 get-email-identity --email-identity "$SES_DOMAIN" --output json 2>/dev/null || echo '{}')"
+row "Domain identity" "${SES_DOMAIN} (verified: $(jq -r '.VerifiedForSendingStatus // "<none>"' <<<"$SES_JSON"))"
+row "DKIM" "$(jq -r '.DkimAttributes.Status // "<none>"' <<<"$SES_JSON")"
+row "Custom MAIL FROM" "${SES_MAIL_FROM_DOMAIN} ($(jq -r '.MailFromAttributes.MailFromDomainStatus // "<none>"' <<<"$SES_JSON"))"
+row "Production access" "$(aws sesv2 get-account --query 'ProductionAccessEnabled' --output text 2>/dev/null || echo "unknown") (False = sandbox)"
+SES_SMTP_USER="${PROJECT}-${ENVIRONMENT}-ses-smtp"
+if aws iam get-user --user-name "$SES_SMTP_USER" >/dev/null 2>&1; then
+  row "SMTP IAM user" "${SES_SMTP_USER} (exists)"
+else
+  row "SMTP IAM user" "<none>"
+fi
+
 section "DNS"
 row "Backend domain" "$BACKEND_DOMAIN"
 row "Frontend domain" "$FRONTEND_DOMAIN"

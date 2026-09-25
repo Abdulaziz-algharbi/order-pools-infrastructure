@@ -33,7 +33,7 @@ orderPool/
 
 Two deliberate departures from the "obvious" version of this diagram, both explained in depth in [Security considerations](#18-security-considerations):
 
-- **No NAT Gateway.** The backend EC2 instance sits in a *public* subnet with a direct route to the Internet Gateway, not a private subnet behind a NAT Gateway. The security group is the enforcement boundary instead (ALB-only inbound; outbound limited to 443/80/27017/tcp + DNS — see [Security considerations](#18-security-considerations) for exactly why each port is there) — this was a deliberate cost/complexity trade-off for a dev/demo-stage project (a NAT Gateway alone runs ~$40+/month).
+- **No NAT Gateway.** The backend EC2 instance sits in a *public* subnet with a direct route to the Internet Gateway, not a private subnet behind a NAT Gateway. The security group is the enforcement boundary instead (ALB-only inbound; outbound limited to 443/80/27017/587/tcp + DNS — see [Security considerations](#18-security-considerations) for exactly why each port is there) — this was a deliberate cost/complexity trade-off for a dev/demo-stage project (a NAT Gateway alone runs ~$40+/month).
 - **In-place restart deploys**, not blue/green or canary. There's a single EC2 instance; deploying restarts the same process in place. A few seconds of downtime per deploy, and a failed deploy takes down the only target until rolled back. Deliberate, confirmed trade-off for this stage — see [Backend deployment](#8-backend-deployment).
 
 **Resource dependency order** (what `deploy.sh` actually runs, in order):
@@ -90,6 +90,7 @@ cd infrastructure
 ./deploy.sh dev                              # provisions all AWS infrastructure
 cp config/dev.secrets.env.example config/dev.secrets.env
 $EDITOR config/dev.secrets.env               # fill in the real Atlas password, JWT secrets, etc.
+./email/01-ses.sh dev                        # SES domain + DNS + SMTP credentials -> secrets file (see §19)
 ./backend/env-to-ssm.sh dev                  # pushes them to SSM Parameter Store
 ./backend/deploy-backend.sh dev              # builds + ships order-pools-backend
 ./frontend/deploy-frontend.sh dev            # builds + ships order-pools-app
@@ -222,6 +223,8 @@ Both work because the instance's IAM role (`iam/01-ec2-instance-role.sh`) has `A
 | Target group shows the instance as `unhealthy` | SSH in via `aws ssm start-session --target <id>`, check `systemctl status order-pool-backend` and `journalctl -u order-pool-backend`. Common cause: `config/<env>.secrets.env` was never pushed (`backend/env-to-ssm.sh`) before the first deploy. |
 | Backend can't reach Atlas / connection refused or times out | Check the EC2 instance's current public IP (`./status.sh <env>`) is actually on Atlas's Network Access list — see the Atlas section above about IPs changing if the instance is ever relaunched. |
 | `deploy-backend.sh` reports a failed SSM command | It prints the remote script's stdout/stderr directly — read that first. If a previously-working release is now down, run `backend/rollback-backend.sh <env>`. |
+| Registration succeeds but no verification email arrives | Check, in order: backend logs (`journalctl -u order-pool-backend`) for the nodemailer error; `./test/verify-dev.sh` for the 587 egress rule and SES identity status; whether the account is still in the SES **sandbox** (only verified recipients get mail — `./status.sh` shows it); the recipient's spam folder. |
+| Backend logs `AccessDenied ... ses:SendRawEmail` | The From address doesn't match `SES_FROM_ADDRESS` (the IAM policy pins it) — the backend's `SMTP_FROM` must be the value `email/01-ses.sh` wrote. Re-run it, then `env-to-ssm.sh` and redeploy. |
 | DNS not resolving yet after a Route 53 change | The scripts already wait for `INSYNC` on the change itself, but resolver caches elsewhere (your ISP, browser) can still lag. Check directly with `dig +short <domain>` against a public resolver: `dig @8.8.8.8 +short <domain>`. |
 
 ## 16. Destroying environments
@@ -250,15 +253,43 @@ Every teardown step tolerates the resource already being gone (a partial/interru
 | S3 (both buckets) | Usage-based, negligible at this project's scale (a Vite build + a handful of release tarballs) |
 | CloudFront | Usage-based; PriceClass_100 (NA/EU only) keeps it cheap, and the free tier covers meaningful traffic before any charge |
 | MongoDB Atlas M0 | $0 (free tier) |
+| Amazon SES | ~$0.10 per 1,000 emails sent from EC2 — effectively $0 at this project's volume |
 
 Rough total for a `dev` environment left running continuously: **~$35-40/month**, dominated by the ALB and EC2, not by anything data-transfer-related. Running `./destroy.sh dev` between periods of active use (e.g. between demos) avoids paying for idle infrastructure — nothing here needs to stay up permanently just to preserve state, since all durable state is either in Atlas (external) or reproducible from `order-pools-app`/`order-pools-backend`'s own git history.
 
 ## 18. Security considerations
 
-- **No NAT Gateway; EC2 in a public subnet.** The security group is the sole network boundary: inbound allowed only from the ALB's security group (never a CIDR, never SSH), outbound limited to 443/tcp (HTTPS — SSM, apt's NodeSource source, npm), 80/tcp (HTTP — Ubuntu's own default apt archives; required in practice, since GPG-signed dependencies of packages installed at bootstrap, e.g. NodeSource's nodejs .deb pulling in libatomic1/gcc-14, are served from Ubuntu's plain-HTTP mirrors — apt verifies package integrity via signed release indices regardless of transport, so this doesn't weaken package integrity), 27017/tcp (MongoDB's wire protocol — the actual Atlas data connection, distinct from the DNS lookup `mongodb+srv://` uses to find it), and DNS (53/tcp+udp) scoped to the VPC CIDR only. None of these are narrowed to a smaller CIDR than `0.0.0.0/0`, because neither Ubuntu's mirrors nor Atlas's cluster nodes publish a small, stable IP range to pin instead — the real security boundary for Atlas is its own Network Access allow-list and DB credentials, not this security group. This trades one layer of defense-in-depth (no network path to the instance at all) for real monthly savings, on the premise that the security group is airtight. Revisit for an environment with a lower risk tolerance for that trade-off.
+- **No NAT Gateway; EC2 in a public subnet.** The security group is the sole network boundary: inbound allowed only from the ALB's security group (never a CIDR, never SSH), outbound limited to 443/tcp (HTTPS — SSM, apt's NodeSource source, npm), 587/tcp (SMTP submission with STARTTLS to AWS SES — see [Email (AWS SES)](#19-email-aws-ses)), 80/tcp (HTTP — Ubuntu's own default apt archives; required in practice, since GPG-signed dependencies of packages installed at bootstrap, e.g. NodeSource's nodejs .deb pulling in libatomic1/gcc-14, are served from Ubuntu's plain-HTTP mirrors — apt verifies package integrity via signed release indices regardless of transport, so this doesn't weaken package integrity), 27017/tcp (MongoDB's wire protocol — the actual Atlas data connection, distinct from the DNS lookup `mongodb+srv://` uses to find it), and DNS (53/tcp+udp) scoped to the VPC CIDR only. None of these are narrowed to a smaller CIDR than `0.0.0.0/0`, because neither Ubuntu's mirrors, Atlas's cluster nodes, nor SES's SMTP endpoint publish a small, stable IP range to pin instead — the real security boundary for Atlas is its own Network Access allow-list and DB credentials, not this security group. This trades one layer of defense-in-depth (no network path to the instance at all) for real monthly savings, on the premise that the security group is airtight. Revisit for an environment with a lower risk tolerance for that trade-off.
+- **One long-lived AWS credential, by necessity: the SES SMTP key.** SES's SMTP interface only accepts credentials derived from an IAM user's access key — it can't use the instance role. `email/01-ses.sh` confines it to a dedicated IAM user whose only permission (via a group, per AWS's current guidance) is `ses:SendRawEmail` from exactly `SES_FROM_ADDRESS`, and it's stored only in the gitignored secrets file and an SSM `SecureString`. Rotate by re-running the script with the old key removed from the secrets file, then deleting the old key once redeployed.
 - **No SSH, anywhere.** All administration is SSM Session Manager / Run Command, both authenticated via IAM, both leaving a CloudTrail-auditable record of who ran what — a meaningfully better audit story than SSH key access even setting aside the "no open port" benefit.
 - **IMDSv2 enforced** (`HttpTokens=required`) on the instance, closing the classic SSRF-to-stolen-instance-credentials path IMDSv1 is vulnerable to.
 - **Least-privilege IAM everywhere it was practical**: the EC2 instance role can read only its own SSM parameter path and its own artifact bucket, never `*`. The (planned) GitHub Actions OIDC roles are split three ways by concern (infra/frontend/backend) rather than one broad role.
 - **Secrets never touch git or a Docker layer** — real values live only in SSM `SecureString` parameters, fetched at deploy time and written to a `chmod 600` file owned by a dedicated, unprivileged `orderpool` system user (never root).
 - **Single EC2 instance, in-place restart deploys.** No blue/green, no canary, no ASG — a deliberate, discussed trade-off for this project's current dev/demo stage (see [Backend deployment](#8-backend-deployment)). A failed deploy is a full outage on that one target until `rollback-backend.sh` runs; there is no redundancy to fail over to today.
 - **`destroy.sh`'s bucket-emptying policy is irreversible by design** — see [Destroying environments](#16-destroying-environments).
+
+## 19. Email (AWS SES)
+
+The backend sends email (today: email-verification links, see `order-pools-backend`'s `auth/email-verification.ts`) with nodemailer over SMTP. In AWS that's **Amazon SES's SMTP interface**, set up by two scripts in `email/` — deliberately not part of `deploy.sh`, like `iam/02-github-oidc-roles.sh`: the first writes secrets into your local secrets file, and the second is a request reviewed by a person at AWS.
+
+**`email/01-ses.sh <env>`** — idempotent, safe to re-run:
+
+1. Creates a **domain identity** for `SES_DOMAIN` (`config/<env>.env`) with **Easy DKIM**, and publishes its three `_domainkey` CNAMEs to Route 53.
+2. Sets a **custom MAIL FROM** subdomain (`SES_MAIL_FROM_DOMAIN`) and publishes its MX (to SES's regional feedback endpoint) and SPF TXT records, so SPF aligns with our domain for DMARC.
+3. Publishes a monitor-only **DMARC** record (`p=none`) — *only if the domain has none*. Existing DMARC/MX/SPF records are never overwritten; the script warns instead.
+4. Waits for SES to verify the domain (usually minutes; SES allows up to 72h — a timeout is a warning, re-run later).
+5. Creates the IAM group `<project>-<env>-ses-senders` (policy: `ses:SendRawEmail` on this account's identities in this region, **only** with `ses:FromAddress = SES_FROM_ADDRESS`) and the user `<project>-<env>-ses-smtp` in it.
+6. Mints an access key (unless the secrets file already holds this user's active key), derives the **SES SMTP password** from it locally with AWS's documented HMAC-SHA256 algorithm, and writes `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASS`/`SMTP_FROM`/`SMTP_REPLY_TO` into `config/<env>.secrets.env`. The secret is never printed. If the file held other SMTP credentials, it asks before replacing them.
+
+Then push and redeploy as usual: `./backend/env-to-ssm.sh <env>` and a backend deploy. The backend security group must allow **587/tcp outbound** (`security/01-security-groups.sh` does; re-run it on an existing environment to add the rule).
+
+**The SES sandbox.** New SES accounts can only send *to verified addresses*, max 200/day. To test before leaving it, verify your own inbox: `aws sesv2 create-email-identity --email-identity you@example.com` (SES emails you a confirmation link). **`email/02-ses-production-access.sh <env>`** submits the production-access request (transactional mail, honest use-case description, asks for confirmation first); AWS usually answers within 24h and may ask follow-up questions (typically about bounce/complaint handling) in the AWS Support case it opens. Sandbox status is per account + region, not per environment.
+
+**Sender vs. replies.** Mail goes out as `SES_FROM_NAME <SES_FROM_ADDRESS>` — a no-reply address on our own domain, because that's what SES can sign with DKIM and align for DMARC. Sending "from" a free-mail address (e.g. `@gmail.com`) through SES would fail that provider's DMARC checks and land in spam. Replies are routed to a real inbox instead with a `Reply-To: SES_REPLY_TO` header, which needs no SES verification.
+
+**Region.** SES identities, quotas, sandbox status and SMTP passwords are all regional; everything here uses the environment's `AWS_REGION` (`eu-north-1` has an SES SMTP endpoint: `email-smtp.eu-north-1.amazonaws.com`).
+
+**Teardown.** `destroy.sh` deletes the environment's SMTP IAM user (and its keys) and group — the credentials are environment-scoped. It deliberately **leaves the SES domain identity and its DNS records**: an identity belongs to the account + region, so another environment sending from the same domain would break if one environment's teardown deleted it. It costs nothing to keep; remove it by hand if you're done with the domain entirely.
+
+**Not yet set up:** bounce and complaint handling (an SES configuration set + SNS notifications feeding a suppression step in the app). Worth adding before any real volume — repeated sends to bouncing addresses harm the account's sending reputation.
+
