@@ -58,7 +58,16 @@ echo "--- Seeding the two predefined admin accounts (idempotent, check-and-creat
 # state. Runs as APP_USER, same as the app itself, never as root; env
 # comes from the same shared/.env this deploy just wrote (includes the
 # SEED_ADMIN_* keys pushed via infrastructure/backend/env-to-ssm.sh).
-sudo -u "$APP_USER" bash -c "set -a; source '${APP_ROOT}/shared/.env'; set +a; node '${RELEASE_DIR}/dist/scripts/seed-admins.js'"
+#
+# Loaded with Node's own --env-file, NOT `set -a; source .env` in bash:
+# .env holds unquoted KEY=value lines (see the jq above), which systemd's
+# EnvironmentFile= and dotenv read literally — but bash would execute
+# them. A value with spaces or shell metacharacters (e.g.
+# `SMTP_FROM=Order Pool <no-reply@...>`, a Mongo URI with `&`, a secret
+# with `$`) is a syntax error or worse in bash, which aborted the source
+# partway and left PROD_MONGO_URI unset. --env-file uses the same
+# literal parsing as the app itself.
+sudo -u "$APP_USER" node --env-file="${APP_ROOT}/shared/.env" "${RELEASE_DIR}/dist/scripts/seed-admins.js"
 
 echo "--- Repointing 'current' (atomic symlink swap — this IS the deploy) ---"
 ln -sfn "$RELEASE_DIR" "${APP_ROOT}/current"

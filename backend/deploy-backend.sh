@@ -53,7 +53,11 @@ log_info "Packaging release artifact (package.json + package-lock.json + dist/ â
 cp "${BACKEND_REPO_PATH}/package.json" "${BACKEND_REPO_PATH}/package-lock.json" "$BUILD_DIR/"
 cp -R "${BACKEND_REPO_PATH}/dist" "${BUILD_DIR}/dist"
 TARBALL="${BUILD_DIR}/release.tar.gz"
-tar czf "$TARBALL" -C "$BUILD_DIR" package.json package-lock.json dist
+# COPYFILE_DISABLE + --no-xattrs: macOS's bsdtar otherwise embeds
+# extended attributes (e.g. com.apple.provenance) as LIBARCHIVE.xattr.*
+# headers, which GNU tar on the instance doesn't know and warns about on
+# every deploy. Nothing in the release needs extended attributes.
+COPYFILE_DISABLE=1 tar --no-xattrs -czf "$TARBALL" -C "$BUILD_DIR" package.json package-lock.json dist
 
 OBJECT_KEY="releases/${RELEASE_ID}.tar.gz"
 log_info "Uploading to s3://${BUCKET_NAME}/${OBJECT_KEY}..."
