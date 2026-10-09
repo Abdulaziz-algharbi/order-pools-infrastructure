@@ -1,80 +1,159 @@
 #!/bin/bash
 # Runs on the EC2 instance via `aws ssm send-command` — never over SSH.
-# Placeholders are substituted by deploy-backend.sh before this is sent.
+# Placeholders are substituted by deploy-backend.sh / rollback-backend.sh
+# (and the GitHub reusable workflow) before this is sent.
+#
+# Deploys one image of the backend: pulls it from ECR, writes its
+# settings from SSM Parameter Store, seeds the admins, and (re)starts the
+# container with Docker Compose. A rollback is the same script with
+# IMAGE_TAG="previous": a rollback IS a deploy, of an image that already
+# ran here, so there is one way to start the backend, not two.
 set -Eeuo pipefail
 
 PROJECT="__PROJECT__"
 ENVIRONMENT="__ENVIRONMENT__"
 BACKEND_PORT="__BACKEND_PORT__"
-BUCKET="__ARTIFACT_BUCKET__"
-OBJECT_KEY="__ARTIFACT_KEY__"
 AWS_REGION="__AWS_REGION__"
+IMAGE_REPOSITORY="__IMAGE_REPOSITORY__"   # <account>.dkr.ecr.<region>.amazonaws.com/<name>
+IMAGE_TAG="__IMAGE_TAG__"                 # a git commit SHA, or "previous"
+LOG_GROUP="__LOG_GROUP__"
 APP_ROOT="/opt/${PROJECT}-backend"
-SERVICE_NAME="${PROJECT}-backend"
-APP_USER="orderpool"
-RELEASE_ID="$(date -u +%Y%m%d%H%M%S)"
-RELEASE_DIR="${APP_ROOT}/releases/${RELEASE_ID}"
+COMPOSE_FILE="${APP_ROOT}/compose.yml"
+ENV_FILE="${APP_ROOT}/shared/.env"
+# One line per successful deploy, oldest first: "<UTC time> <tag>". The
+# last line is what's running now (or what last ran healthy, if a deploy
+# after it failed); "previous" is read from here.
+HISTORY_FILE="${APP_ROOT}/deployed-tags"
+# Images kept on disk for a quick rollback (ECR keeps more; an image not
+# here is just pulled again).
+KEEP_LOCAL_IMAGES=3
+REGISTRY="${IMAGE_REPOSITORY%%/*}"
 
-echo "=== Deploying release ${RELEASE_ID} ==="
+touch "$HISTORY_FILE"
+last_good_tag() { tail -n 1 "$HISTORY_FILE" | awk '{print $2}'; }
+# Tag of the image the backend container is running now, if there is one.
+running_tag() {
+  [[ -f "$COMPOSE_FILE" ]] || return 0
+  docker compose -f "$COMPOSE_FILE" ps --format '{{.Image}}' api 2>/dev/null | head -n 1 | sed 's/.*://'
+}
 
-echo "--- Downloading artifact from s3://${BUCKET}/${OBJECT_KEY} ---"
-mkdir -p "$RELEASE_DIR"
-aws s3 cp "s3://${BUCKET}/${OBJECT_KEY}" /tmp/release.tar.gz --region "$AWS_REGION"
-tar xzf /tmp/release.tar.gz -C "$RELEASE_DIR"
-rm -f /tmp/release.tar.gz
+if [[ "$IMAGE_TAG" == "previous" ]]; then
+  LAST_GOOD="$(last_good_tag)"
+  RUNNING="$(running_tag || true)"
+  if [[ -n "$LAST_GOOD" && "$RUNNING" != "$LAST_GOOD" ]]; then
+    # The last deploy failed its health check (or the container is down),
+    # so what's running, if anything, isn't the last image that passed
+    # here: go back to that one.
+    IMAGE_TAG="$LAST_GOOD"
+  else
+    # Everything's healthy: go back to the newest earlier deploy with a
+    # different tag. Rolling back twice therefore toggles between the two
+    # most recent images (the same as the old symlink rollback did).
+    IMAGE_TAG="$(awk '{print $2}' "$HISTORY_FILE" | grep -vxF "${LAST_GOOD:-}" | tail -n 1 || true)"
+  fi
+  [[ -n "$IMAGE_TAG" ]] || { echo "No earlier image deployed here to roll back to." >&2; exit 1; }
+  echo "Rolling back to image ${IMAGE_TAG} (running now: ${RUNNING:-<none>})"
+fi
 
-echo "--- Installing production dependencies (npm ci, not a copied node_modules) ---"
-# The tarball built by deploy-backend.sh deliberately contains only
-# package.json/package-lock.json/dist/ — no node_modules. bcrypt is a
-# native addon; installing it HERE, on the same Ubuntu/x86_64 (or arm64)
-# instance that will run it, is what avoids shipping a macOS-built
-# binary that would crash the moment the process starts on Linux.
-(cd "$RELEASE_DIR" && npm ci --omit=dev)
+IMAGE="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+echo "=== Deploying ${IMAGE} ==="
+
+echo "--- Pulling the image from ECR ---"
+# get-login-password trades the instance role's credentials for a
+# 12-hour registry token. `docker login` stores it in root's
+# ~/.docker/config.json; logging out once the pull is done keeps it off
+# disk. Nothing needs it again until the next deploy pulls.
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin "$REGISTRY"
+docker pull "$IMAGE"
+docker logout "$REGISTRY"
 
 echo "--- Writing environment file from SSM Parameter Store ---"
 # Every parameter under /project/env/backend/ becomes one KEY=VALUE
 # line. Written to a temp file and moved into place atomically
 # (`mv` within the same filesystem is atomic) so nothing ever reads a
-# half-written env file.
+# half-written env file. Only root reads it (the Docker daemon, to pass
+# the values into the container).
 aws ssm get-parameters-by-path \
   --path "/${PROJECT}/${ENVIRONMENT}/backend/" \
   --with-decryption --region "$AWS_REGION" \
   --query 'Parameters[]' --output json \
-  | jq -r '.[] | "\(.Name | split("/") | last)=\(.Value)"' > "${APP_ROOT}/shared/.env.new"
-mv "${APP_ROOT}/shared/.env.new" "${APP_ROOT}/shared/.env"
-chmod 600 "${APP_ROOT}/shared/.env"
-
-echo "--- Fixing ownership (app runs as ${APP_USER}, never root) ---"
-chown -R "${APP_USER}:${APP_USER}" "$RELEASE_DIR" "${APP_ROOT}/shared/.env"
+  | jq -r '.[] | "\(.Name | split("/") | last)=\(.Value)"' > "${ENV_FILE}.new"
+chmod 600 "${ENV_FILE}.new"
+mv "${ENV_FILE}.new" "$ENV_FILE"
 
 echo "--- Seeding the two predefined admin accounts (idempotent, check-and-create) ---"
 # order-pools-backend/scripts/seed-admins.ts does a findOne-then-create
 # per admin (skips ones that already exist), so it's safe to run on
 # every deploy rather than only once. Deliberately NOT called from
-# server.ts's boot path instead: that would re-run it on every systemd
-# Restart=on-failure crash-loop, not just once per real deploy. Runs
-# before the symlink swap/restart below so a seed failure leaves the
-# previous good release running rather than restarting into a half-done
-# state. Runs as APP_USER, same as the app itself, never as root; env
-# comes from the same shared/.env this deploy just wrote (includes the
-# SEED_ADMIN_* keys pushed via infrastructure/backend/env-to-ssm.sh).
+# server.ts's boot path instead: that would re-run it on every container
+# restart, not just once per real deploy. Runs in a throwaway container
+# of the NEW image before the backend container is replaced, so a seed
+# failure leaves the previous container running rather than restarting
+# into a half-done state.
 #
-# Loaded with Node's own --env-file, NOT `set -a; source .env` in bash:
-# .env holds unquoted KEY=value lines (see the jq above), which systemd's
-# EnvironmentFile= and dotenv read literally — but bash would execute
-# them. A value with spaces or shell metacharacters (e.g.
-# `SMTP_FROM=Order Pool <no-reply@...>`, a Mongo URI with `&`, a secret
-# with `$`) is a syntax error or worse in bash, which aborted the source
-# partway and left PROD_MONGO_URI unset. --env-file uses the same
-# literal parsing as the app itself.
-sudo -u "$APP_USER" node --env-file="${APP_ROOT}/shared/.env" "${RELEASE_DIR}/dist/scripts/seed-admins.js"
+# `docker run --env-file` reads each line literally (KEY=everything after
+# the first =), the same as the app's own dotenv and the compose file's
+# `format: raw` below — never through a shell, so a value with spaces,
+# `&` or `$` (e.g. `SMTP_FROM=Order Pool <no-reply@...>`, the Mongo URI)
+# arrives intact.
+docker run --rm --env-file "$ENV_FILE" "$IMAGE" node dist/scripts/seed-admins.js
 
-echo "--- Repointing 'current' (atomic symlink swap — this IS the deploy) ---"
-ln -sfn "$RELEASE_DIR" "${APP_ROOT}/current"
+echo "--- Writing ${COMPOSE_FILE} ---"
+# What runs, rewritten on every deploy (the image tag is the only part
+# that normally changes):
+#   ports            the ALB's target group sends traffic to the host's
+#                    BACKEND_PORT; the app inside always listens on 8000
+#                    (PORT below overrides any PORT from SSM).
+#   env_file raw     values taken literally — Compose's default format
+#                    would expand `$` in a secret as a variable.
+#   restart          the Docker daemon restarts the container if it
+#                    crashes and after a reboot — what the systemd unit's
+#                    Restart= used to do. `unless-stopped` leaves a
+#                    container someone stopped by hand stopped.
+#   stop_grace_period  `docker stop` sends SIGTERM, which server.ts
+#                    handles (closes the HTTP server and the Mongo
+#                    connection); SIGKILL only after 10s.
+#   logging awslogs  stdout goes to CloudWatch Logs, one stream per
+#                    deploy, so logs outlive the container. non-blocking:
+#                    if CloudWatch is slow or unreachable, log lines are
+#                    buffered (up to 4 MB, then dropped) instead of
+#                    blocking the app's writes to stdout — a logging
+#                    outage must never stall request handling.
+STREAM="api-$(date -u +%Y%m%d%H%M%S)-${IMAGE_TAG:0:7}"
+cat > "${COMPOSE_FILE}.new" <<EOF
+name: ${PROJECT}-backend
+services:
+  api:
+    image: ${IMAGE}
+    ports:
+      - "${BACKEND_PORT}:8000"
+    env_file:
+      - path: ${ENV_FILE}
+        format: raw
+    environment:
+      PORT: "8000"
+    restart: unless-stopped
+    stop_grace_period: 10s
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: ${LOG_GROUP}
+        awslogs-stream: ${STREAM}
+        mode: non-blocking
+        max-buffer-size: 4m
+EOF
+mv "${COMPOSE_FILE}.new" "$COMPOSE_FILE"
 
-echo "--- Restarting ${SERVICE_NAME} ---"
-systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
-systemctl restart "${SERVICE_NAME}"
+echo "--- Starting the container (replaces the running one, if any) ---"
+# `up -d` compares the running container with compose.yml and recreates
+# it when the image (or anything else) changed: stop the old one
+# (SIGTERM), start the new one. That gap is this project's in-place
+# deploy downtime — a few seconds, the same trade-off as the systemd
+# restart before it. --remove-orphans removes containers of services
+# that are no longer in the file.
+docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
 
 echo "--- Waiting for the app to answer locally on :${BACKEND_PORT}/ping ---"
 # 30 attempts * 3s = ~90s. order-pools-backend/src/server.ts starts the
@@ -93,13 +172,35 @@ for i in $(seq 1 30); do
     break
   fi
   if [[ "$i" -eq 30 ]]; then
-    echo "Health check FAILED after 30 attempts (~90s) — deployment did not come up healthy." >&2
+    echo "Health check FAILED after 30 attempts (~90s) — ${IMAGE} did not come up healthy." >&2
+    echo "--- container status ---" >&2
+    docker compose -f "$COMPOSE_FILE" ps -a >&2 || true
+    echo "--- last 50 log lines (all of them: aws logs tail ${LOG_GROUP} --log-stream-names ${STREAM}) ---" >&2
+    docker compose -f "$COMPOSE_FILE" logs --tail 50 api >&2 || true
     exit 1
   fi
   sleep 3
 done
 
-echo "--- Pruning old releases (keeping the 5 most recent, for rollback) ---"
-ls -1dt "${APP_ROOT}"/releases/*/ 2>/dev/null | tail -n +6 | xargs -r rm -rf
+# Only a healthy deploy goes into the history, so "previous" never
+# rolls back to an image that failed here.
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${IMAGE_TAG}" >> "$HISTORY_FILE"
+tail -n 50 "$HISTORY_FILE" > "${HISTORY_FILE}.new" && mv "${HISTORY_FILE}.new" "$HISTORY_FILE"
 
-echo "=== Deployment of ${RELEASE_ID} complete ==="
+echo "--- Pruning old images (keeping the ${KEEP_LOCAL_IMAGES} most recently deployed) ---"
+# Each image is a few hundred MB, sharing its base layers with the
+# others. Keeps the newest distinct tags from the history (the running
+# one is always among them); `docker image prune` then removes layers
+# nothing refers to any more. Pruning is housekeeping: a failure here
+# must not turn a healthy deploy into a failed one.
+KEEP_TAGS="$(awk '{print $2}' "$HISTORY_FILE" | tac | awk '!seen[$0]++' | head -n "$KEEP_LOCAL_IMAGES")"
+docker image ls "$IMAGE_REPOSITORY" --format '{{.Tag}}' | while read -r tag; do
+  if ! grep -qxF "$tag" <<<"$KEEP_TAGS"; then
+    docker image rm "${IMAGE_REPOSITORY}:${tag}" >/dev/null \
+      && echo "Removed ${IMAGE_REPOSITORY}:${tag}" \
+      || echo "Could not remove ${IMAGE_REPOSITORY}:${tag} — left in place."
+  fi
+done || true
+docker image prune -f >/dev/null || true
+
+echo "=== Deployment of ${IMAGE} complete ==="

@@ -60,7 +60,7 @@ Frontend and backend infrastructure are independent of each other (either half c
 ## 2. Prerequisites
 
 - `bash`, `aws` (CLI v2), `jq`, `git` — every script checks for these and fails immediately with a clear message if one is missing.
-- `node`/`npm` — not needed to provision infrastructure, but required for `backend/deploy-backend.sh` and `frontend/deploy-frontend.sh`, which build the actual applications.
+- `docker` (with buildx, as in Docker Desktop) and `node`/`npm` — not needed to provision infrastructure, but required to deploy the applications from a laptop: `backend/deploy-backend.sh` builds the backend's Docker image, `frontend/deploy-frontend.sh` builds the frontend with npm.
 - An AWS account with `aws configure` (or `AWS_PROFILE`) already working — verify with `aws sts get-caller-identity`.
 - A Route 53 hosted zone already created for your domain (NS/SOA records set at your registrar) — this project uses subdomains within an existing zone, it doesn't create the zone itself.
 - A MongoDB Atlas cluster — see [MongoDB Atlas](#14-mongodb-atlas). Not provisioned by this repo.
@@ -121,19 +121,32 @@ CloudFront's `CustomErrorResponses` rewrite both 403 and 404 to `/index.html` wi
 
 ## 8. Backend deployment
 
-> **Migration in progress: the backend now ships as a Docker image.** The image is built from `order-pools-backend/Dockerfile`, stored in a private ECR repository (`backend/05-ecr-repository.sh`), and logs to CloudWatch Logs (`backend/06-log-group.sh`). An instance launched now gets Docker Engine and no Node.js. The release flow below (tarball, `npm ci` on the instance, systemd) is the one being replaced. Until `deploy-backend.sh`/`deploy-remote.sh.tmpl` and the GitHub workflow are switched to images, don't deploy the backend to a newly launched instance.
+The backend ships as a **Docker image** built from `order-pools-backend/Dockerfile`. It is built once, tested, pushed to a private ECR repository (`backend/05-ecr-repository.sh`) tagged with its git commit SHA, and pulled by the instance. Nothing is compiled or installed on the instance at deploy time, so what runs there is byte-for-byte what was tested. The previous flow (a tarball of `dist/`, `npm ci` on the instance, a systemd unit) is gone; the S3 artifact bucket is no longer used by deploys and will be removed.
 
-`backend/01-ec2-instance.sh` launches a single Ubuntu 24.04 LTS instance (AMI resolved dynamically via Canonical's own SSM public parameter — never hardcoded) with an encrypted gp3 root volume of `ROOT_VOLUME_GB` and Docker Engine + the Compose plugin installed (`backend/bootstrap.sh.tmpl`), but no backend container yet. The previous, tarball-based `backend/deploy-backend.sh`:
-1. Builds `order-pools-backend` locally (`npm ci && npm run build`).
-2. Packages `package.json` + `package-lock.json` + `dist/` into a tarball — **deliberately no `node_modules`**. `bcrypt` is a native addon; installing it via `npm ci` *on the instance itself* (which `deploy-remote.sh.tmpl` does) is what guarantees the binary matches the instance's actual OS/architecture, rather than shipping one built on your laptop.
-3. Uploads the tarball to a private S3 bucket, then sends an SSM command telling the instance to pull it down, install dependencies, write its `.env` from SSM Parameter Store, atomically swap the `releases/<timestamp>` → `current` symlink, and `systemctl restart`.
+`backend/01-ec2-instance.sh` launches a single Ubuntu 24.04 LTS instance (AMI resolved dynamically via Canonical's own SSM public parameter — never hardcoded) with an encrypted gp3 root volume of `ROOT_VOLUME_GB` and Docker Engine + the Compose plugin installed (`backend/bootstrap.sh.tmpl`). There's no Node.js on it: the Node version is the image's.
+
+`backend/deploy-backend.sh <env>` does from a laptop what GitHub Actions does on every push (section 9):
+1. Builds the image from your `order-pools-backend` checkout for `IMAGE_PLATFORM` (the instance's CPU — `linux/amd64` for t3, built under emulation on an Apple Silicon Mac). It's tagged with the commit SHA, or `<sha>-dirty-<time>` if the checkout has uncommitted changes. If that tag is already in ECR (e.g. CI built it), it deploys that image instead of building.
+2. Pushes it to ECR (tags are immutable: a tag always means one exact build).
+3. Sends `deploy-remote.sh.tmpl` to the instance via SSM (`lib/ssm.sh`, which polls for up to 10 minutes). On the instance, that script:
+   - logs in to ECR with the instance role and pulls the image;
+   - writes `/opt/order-pool-backend/shared/.env` from SSM Parameter Store;
+   - seeds the admins in a throwaway container of the new image;
+   - writes `/opt/order-pool-backend/compose.yml` and runs `docker compose up -d`, which replaces the running container;
+   - checks `/ping` locally for up to ~90s and records the tag in `/opt/order-pool-backend/deployed-tags`;
+   - prunes old images, keeping the 3 most recently deployed.
 4. Polls the ALB target group until it reports healthy.
 
-This is **pull-based**: the instance always initiates the S3 download and the parameter fetch over its own IAM role; nothing is ever pushed to it over SSH (there is no SSH — administration is SSM Session Manager only).
+On the instance, Docker (not systemd) keeps the backend running: the container has `restart: unless-stopped`, and the Docker service starts on boot. The container's stdout goes to CloudWatch Logs (`backend/06-log-group.sh`, 14-day retention), one stream per deploy: `aws logs tail /order-pool/<env>/backend --follow`. On stop, Docker sends `SIGTERM`, which `order-pools-backend/src/server.ts` handles to close the HTTP server and the Mongo connection cleanly.
 
-**Deploy strategy is in-place restart**, not blue/green or canary — confirmed deliberately for this project's dev/demo stage (see the architecture note above). `backend/rollback-backend.sh` re-points the `current` symlink at the previous release and restarts, for when a bad deploy needs undoing.
+This is **pull-based**: the instance pulls the image and reads its parameters over its own IAM role; nothing is ever pushed to it over SSH (there is no SSH — administration is SSM Session Manager only).
 
-`KillSignal=SIGINT` in the systemd unit (not the default `SIGTERM`) matches `order-pools-backend/src/server.ts`, which only traps `SIGINT` for its graceful-shutdown path (closes the HTTP server + Mongo connection cleanly) — solved at the infrastructure layer instead of touching application code.
+**Deploy strategy is in-place restart**, not blue/green or canary — confirmed deliberately for this project's dev/demo stage (see the architecture note above): the old container stops, then the new one starts, a few seconds apart. A failed health check leaves the backend down until a rollback.
+
+`backend/rollback-backend.sh <env> [tag]` is a deploy of an earlier image: the same remote script, with `previous` instead of a new tag (or a specific tag from ECR).
+- If the latest deploy failed, `previous` means the last image that was healthy on the instance.
+- Otherwise it means the image deployed before the current one, so rolling back twice toggles between the two most recent images.
+- It re-reads the settings from SSM, so the image goes back but the configuration stays current.
 
 ## 9. GitHub Actions
 
@@ -152,7 +165,7 @@ order-pool-<env>-backend-deploy    -> scoped to the artifact bucket + ssm:SendCo
 
 **Workflows**, one per app repo (deliberately none in `order-pools-infrastructure` itself):
 
-- `order-pools-backend/.github/workflows/deploy.yml` — builds and tests the app (own checkout, own `npm ci`/`npm test`/`npm run build`), packages the same no-`node_modules` tarball `deploy-backend.sh` does, uploads it to S3, then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` to do the actual render/SSM-send/poll mechanics.
+- `order-pools-backend/.github/workflows/deploy.yml` — runs the unit tests, builds the Docker image, runs the whole API suite against that image (with a MongoDB replica set started from the repo's `docker-compose.yml`), pushes it to ECR as `:<commit SHA>`, then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` with that tag to do the actual render/SSM-send/poll mechanics.
 - `order-pools-app/.github/workflows/deploy.yml` — fully self-contained: build (with `VITE_API_BASE_URL` injected the same way `deploy-frontend.sh` does), `s3 sync` (two-pass cache headers), CloudFront invalidation, no cross-repo call.
 
 Both trigger on **push to `main`** (real continuous deployment) as well as manual `workflow_dispatch`, and both are confirmed working end-to-end against the live `dev` environment.

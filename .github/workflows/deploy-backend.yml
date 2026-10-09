@@ -5,9 +5,10 @@
 # This exists so the "how do we get a build onto the EC2 instance"
 # logic has exactly one implementation (mirroring backend/deploy-backend.sh
 # and backend/deploy-remote.sh.tmpl), not a second copy pasted into the
-# backend repo's own workflow. It does NOT build the application — that
-# needs order-pools-backend's own source checked out, which naturally
-# happens in the CALLING workflow, not here.
+# backend repo's own workflow. It does NOT build the image — that needs
+# order-pools-backend's own source checked out, which naturally happens
+# in the CALLING workflow, which also tests the image and pushes it to
+# ECR before calling this.
 #
 # Cross-repo reuse works here without a PAT/deploy key because reusable
 # workflows (on: workflow_call) are specifically designed to be callable
@@ -22,8 +23,8 @@ on:
       environment:
         required: true
         type: string
-      artifact_key:
-        description: "S3 key (under the artifact bucket) of the release tarball the caller already uploaded"
+      image_tag:
+        description: "Tag (the commit SHA) of the backend image the caller already pushed to the environment's ECR repository"
         required: true
         type: string
 
@@ -43,7 +44,7 @@ jobs:
     # (infrastructure/iam/02-github-oidc-roles.sh) checks that claim.
     environment: ${{ inputs.environment }}
     steps:
-      - name: Checkout infrastructure (for deploy-remote.sh.tmpl)
+      - name: Checkout infrastructure (for deploy-remote.sh.tmpl and lib/)
         # `repository:` must be explicit here. actions/checkout@v4's
         # default (no `repository:` given) resolves `${{ github.repository }}`,
         # and inside a job that belongs to a CALLED reusable workflow,
@@ -67,16 +68,18 @@ jobs:
       - name: Resolve resource IDs from SSM Parameter Store
         id: resolve
         # These were written by backend/01-ec2-instance.sh,
-        # backend/02-artifact-bucket.sh and backend/03-target-group.sh
-        # under /order-pool/<env>/state/backend/... — the exact same
-        # values your laptop would read via lib/state.sh's get_output.
+        # backend/03-target-group.sh, backend/05-ecr-repository.sh and
+        # backend/06-log-group.sh under /order-pool/<env>/state/backend/...
+        # — the exact same values your laptop would read via
+        # lib/state.sh's get_output.
         run: |
           set -Eeuo pipefail
           PATH_PREFIX="/order-pool/${{ inputs.environment }}/state/backend"
           {
             echo "instance_id=$(aws ssm get-parameter --name "${PATH_PREFIX}/instance-id" --query Parameter.Value --output text)"
             echo "tg_arn=$(aws ssm get-parameter --name "${PATH_PREFIX}/target-group-arn" --query Parameter.Value --output text)"
-            echo "bucket=$(aws ssm get-parameter --name "${PATH_PREFIX}/artifact-bucket-name" --query Parameter.Value --output text)"
+            echo "repository_uri=$(aws ssm get-parameter --name "${PATH_PREFIX}/ecr-repository-uri" --query Parameter.Value --output text)"
+            echo "log_group=$(aws ssm get-parameter --name "${PATH_PREFIX}/log-group-name" --query Parameter.Value --output text)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Render the remote deploy script
@@ -88,47 +91,27 @@ jobs:
             -e "s|__PROJECT__|order-pool|g" \
             -e "s|__ENVIRONMENT__|${{ inputs.environment }}|g" \
             -e "s|__BACKEND_PORT__|${{ vars.BACKEND_PORT }}|g" \
-            -e "s|__ARTIFACT_BUCKET__|${{ steps.resolve.outputs.bucket }}|g" \
-            -e "s|__ARTIFACT_KEY__|${{ inputs.artifact_key }}|g" \
             -e "s|__AWS_REGION__|${{ vars.AWS_REGION }}|g" \
+            -e "s|__IMAGE_REPOSITORY__|${{ steps.resolve.outputs.repository_uri }}|g" \
+            -e "s|__IMAGE_TAG__|${{ inputs.image_tag }}|g" \
+            -e "s|__LOG_GROUP__|${{ steps.resolve.outputs.log_group }}|g" \
             backend/deploy-remote.sh.tmpl > /tmp/deploy-remote.sh
 
-      - name: Send the deployment command via SSM (no SSH involved)
-        id: send
+      - name: Run it on the instance via SSM (no SSH involved)
+        # The same helper deploy-backend.sh uses (lib/ssm.sh): send the
+        # script as an AWS-RunShellScript command, poll until it finishes
+        # (up to 10 minutes — longer than `aws ssm wait command-executed`'s
+        # ~100s, which a pull + seed + up-to-90s health check can exceed),
+        # print its output, and fail the job unless it succeeded.
+        # The comment uses a short SHA: send-command's --comment has a
+        # hard 100-char limit (ValidationException, confirmed live).
         run: |
           set -Eeuo pipefail
-          COMMANDS_JSON=$(jq -n --arg script "$(cat /tmp/deploy-remote.sh)" '{commands: [$script]}')
-          # aws ssm send-command --comment has a hard 100-char limit
-          # (ValidationException, confirmed live) — the full 40-char
-          # commit SHA alone was enough to blow past it combined with
-          # the rest of the text, which is why this never showed up in
-          # backend/deploy-backend.sh's local runs (its comment is much
-          # shorter). Bash substring expansion on GITHUB_SHA for a short
-          # SHA instead of the ${{ github.sha }} YAML expression, which
-          # has no built-in way to truncate it.
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "${{ steps.resolve.outputs.instance_id }}" \
-            --document-name "AWS-RunShellScript" \
-            --comment "order-pool ${{ inputs.environment }} backend deploy (run ${{ github.run_id }}, ${GITHUB_SHA:0:7})" \
-            --parameters "$COMMANDS_JSON" \
-            --query 'Command.CommandId' --output text)
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for the remote script to finish
-        run: |
-          set -Eeuo pipefail
-          INSTANCE_ID="${{ steps.resolve.outputs.instance_id }}"
-          COMMAND_ID="${{ steps.send.outputs.command_id }}"
-          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" || true
-          STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query Status --output text)
-          echo "--- remote stdout ---"
-          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query StandardOutputContent --output text
-          echo "--- remote stderr ---"
-          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --query StandardErrorContent --output text
-          if [ "$STATUS" != "Success" ]; then
-            echo "::error::Remote deployment script finished with status: $STATUS"
-            exit 1
-          fi
+          source lib/common.sh
+          source lib/ssm.sh
+          ssm_run_script "${{ steps.resolve.outputs.instance_id }}" \
+            "order-pool ${{ inputs.environment }} backend deploy (run ${{ github.run_id }}, ${GITHUB_SHA:0:7})" \
+            /tmp/deploy-remote.sh
 
       - name: Wait for the ALB target group to report healthy
         run: |
