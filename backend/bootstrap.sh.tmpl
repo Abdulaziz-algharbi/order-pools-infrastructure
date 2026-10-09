@@ -1,43 +1,78 @@
 #!/bin/bash
 # Runs ONCE, as root, on first boot (cloud-init "user data"). Placeholders
-# like __NODE_MAJOR_VERSION__ are substituted by backend/01-ec2-instance.sh
-# before this is passed to `aws ec2 run-instances --user-data`.
+# like __PROJECT__ are substituted by backend/01-ec2-instance.sh before
+# this is passed to `aws ec2 run-instances --user-data`.
+#
+# The backend runs as a Docker container (order-pools-backend/Dockerfile),
+# so this instance needs no Node.js or npm at all: only the Docker Engine
+# to run the image, and the AWS CLI + jq the deploy script uses to pull it
+# and write its settings. The Node version lives in the image, not here.
 set -Eeuo pipefail
 exec > >(tee -a /var/log/order-pool-bootstrap.log) 2>&1
 echo "=== order-pool bootstrap starting: $(date -u) ==="
 
-APP_USER="orderpool"
 APP_ROOT="/opt/__PROJECT__-backend"
-SERVICE_NAME="__PROJECT__-backend"
-NODE_MAJOR_VERSION="__NODE_MAJOR_VERSION__"
 
-echo "--- Installing Node.js ${NODE_MAJOR_VERSION}.x via NodeSource ---"
-# NodeSource's setup script is the standard, reliable way to get a
-# specific Node major version onto Ubuntu without building from source
-# or relying on Ubuntu's own (often stale) distro package. The version
-# comes from config/<env>.env's NODE_MAJOR_VERSION, kept in sync with
-# order-pools-backend's own pinned Node version — not hardcoded here.
+echo "--- Installing Docker Engine and the Compose plugin from Docker's apt repository ---"
+# Docker's own repository rather than Ubuntu's `docker.io` package: it's
+# the install Docker documents and supports, it tracks current Engine
+# releases, and it carries `docker-compose-plugin` (the `docker compose`
+# subcommand the deploy uses). Packages are verified against Docker's
+# GPG key, pinned to this one repository with `signed-by`. Fetched over
+# 443 (download.docker.com); Ubuntu's own archives — for ca-certificates,
+# curl and Docker's dependencies — over 80, as the security group allows.
 apt-get update -y
-curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_VERSION}.x" | bash -
-apt-get install -y nodejs
+apt-get install -y ca-certificates curl
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+# shellcheck source=/dev/null
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
-# `set -e` already aborts this script the instant `apt-get install`
-# returns non-zero, so a hard package-manager failure can't reach this
-# point at all. This check is for the narrower, sneakier case: node/npm
-# ending up on PATH but non-functional (a partial/corrupt install that
-# still exits 0). Bootstrap must not report success in that case either.
-echo "--- Verifying the Node.js install ---"
-node --version || { echo "FATAL: node --version failed after install" >&2; exit 1; }
-npm --version || { echo "FATAL: npm --version failed after install" >&2; exit 1; }
+echo "--- Configuring the Docker daemon ---"
+# log-driver/log-opts: the DEFAULT for any container that doesn't choose
+# its own. The backend's container sends its logs to CloudWatch (awslogs
+# driver, set per container by the deploy); this default only covers
+# anything else run here by hand (e.g. the one-off admin-seed container),
+# and caps each such container's local log at 3 x 10 MB instead of
+# Docker's default of unbounded — a small root disk can fill up.
+# live-restore: containers keep running while the Docker daemon itself
+# restarts (e.g. a Docker package upgrade), instead of all stopping with
+# it.
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "live-restore": true
+}
+EOF
+# enable: start on every boot, which is what brings the backend back up
+# after a reboot — its container has `restart: unless-stopped`, so the
+# daemon restarts it. This replaces the systemd unit the app used to
+# have; systemd now only manages Docker itself.
+systemctl enable docker
+systemctl restart docker
+
+# `set -e` already stops this script if an install fails outright. This
+# catches the sneakier case of a binary on PATH that doesn't work — e.g.
+# the daemon failing to start on the config above. Bootstrap must not
+# report success then.
+echo "--- Verifying the Docker install ---"
+docker version || { echo "FATAL: docker version failed — is the daemon running?" >&2; exit 1; }
+docker compose version || { echo "FATAL: docker compose version failed after install" >&2; exit 1; }
 
 echo "--- Installing the AWS CLI v2 and jq ---"
 # The SSM Agent (which lets `aws ssm send-command` reach this instance
 # at all) is a separate, statically-compiled binary with no relation to
 # the `aws` CLI tool — neither it nor Ubuntu's stock image includes the
-# CLI. deploy-remote.sh.tmpl needs both `aws` (s3 cp, ssm
-# get-parameters-by-path) and `jq` (parsing that command's JSON output
-# into .env lines) to run at all, so both are installed explicitly here
-# rather than assumed present.
+# CLI. deploy-remote.sh.tmpl needs both `aws` (ecr get-login-password,
+# ssm get-parameters-by-path) and `jq` (parsing that command's JSON
+# output into .env lines) to run at all, so both are installed
+# explicitly here rather than assumed present.
 apt-get install -y unzip jq
 curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
 unzip -q /tmp/awscliv2.zip -d /tmp
@@ -55,49 +90,18 @@ echo "--- Confirming the SSM Agent is running ---"
 systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service || \
   echo "WARNING: could not enable the snap SSM agent service — check manually via the SSM console."
 
-echo "--- Creating a dedicated, unprivileged app user and directories ---"
-# The application must never run as root: a compromised Express process
-# should only ever be able to touch its own release directory, nothing
-# else on the box.
-id -u "$APP_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$APP_USER"
-mkdir -p "${APP_ROOT}/releases" "${APP_ROOT}/shared"
-chown -R "${APP_USER}:${APP_USER}" "$APP_ROOT"
+echo "--- Creating the app directory ---"
+# Layout (filled in by deploy-remote.sh.tmpl, not here):
+#   APP_ROOT/compose.yml    which image runs, its port, restart policy and
+#                           log driver — rewritten on every deploy
+#   APP_ROOT/shared/.env    settings and secrets pulled from SSM Parameter
+#                           Store at deploy time, never baked into the
+#                           image or this script
+# Owned by root and closed to everyone else: only the Docker daemon
+# (root) reads .env, to hand its values to the container. The app itself
+# runs as the image's unprivileged `node` user, inside the container.
+mkdir -p "${APP_ROOT}/shared"
+chmod 700 "${APP_ROOT}" "${APP_ROOT}/shared"
 
-echo "--- Installing the systemd unit (not started yet — no release deployed) ---"
-# Release layout (populated by Phase 3's deploy-backend.sh, not here):
-#   APP_ROOT/releases/<timestamp>/   one directory per deployed build
-#   APP_ROOT/current -> releases/<timestamp>   symlink, atomically
-#                                               repointed on each deploy
-#                                               (enables instant rollback
-#                                               by repointing it back)
-#   APP_ROOT/shared/.env             secrets pulled from SSM Parameter
-#                                     Store at deploy time, never baked
-#                                     into the release or this script
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Order Pool backend (Express/TypeScript)
-After=network.target
-
-[Service]
-Type=simple
-User=${APP_USER}
-WorkingDirectory=${APP_ROOT}/current
-EnvironmentFile=${APP_ROOT}/shared/.env
-ExecStart=/usr/bin/node ${APP_ROOT}/current/dist/src/server.js
-Restart=on-failure
-RestartSec=5
-# order-pools-backend/src/server.ts only traps SIGINT to shut down
-# gracefully (closes the HTTP server + Mongo connection cleanly before
-# exiting) — it does not handle SIGTERM, systemd's default stop signal.
-# Rather than changing application code for an infrastructure concern,
-# systemd is told to send the signal the app already understands.
-KillSignal=SIGINT
-TimeoutStopSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
 echo "=== order-pool bootstrap complete: $(date -u) ==="
-echo "${SERVICE_NAME} is installed but NOT enabled/started — run deploy-backend.sh (Phase 3) to ship a release and start it."
+echo "Docker is running, but no backend container yet — the first deploy (deploy-backend.sh) pulls the image and starts it."

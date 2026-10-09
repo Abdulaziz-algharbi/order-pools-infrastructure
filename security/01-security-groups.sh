@@ -75,13 +75,13 @@ done
 #             CIDR-based rule exists at all — nothing on the open
 #             internet can reach port 8000 directly, only traffic that
 #             has already passed through the ALB.
-#   Outbound: 443/tcp (HTTPS — SSM control plane, apt's NodeSource
-#             source, npm), 80/tcp (HTTP — Ubuntu's own default package
-#             archives, which real dependencies of the NodeSource nodejs
-#             .deb, e.g. libatomic1/gcc-14, pull from at bootstrap; apt
-#             verifies GPG-signed release indices regardless of
-#             transport, so HTTP-for-apt doesn't weaken package
-#             integrity), 27017/tcp (MongoDB's wire protocol — what a
+#   Outbound: 443/tcp (HTTPS — SSM control plane, ECR image pulls and
+#             their S3 layer downloads, CloudWatch Logs, Docker's apt
+#             repository), 80/tcp (HTTP — Ubuntu's own default package
+#             archives, which bootstrap installs from: ca-certificates,
+#             curl, jq and Docker's dependencies; apt verifies
+#             GPG-signed release indices regardless of transport, so
+#             HTTP-for-apt doesn't weaken package integrity), 27017/tcp (MongoDB's wire protocol — what a
 #             mongodb+srv:// connection to Atlas actually uses for data,
 #             as distinct from the DNS SRV/TXT lookup that discovers the
 #             hostnames in the first place), 587/tcp (SMTP submission
@@ -135,10 +135,11 @@ else
   log_info "Default allow-all egress rule already absent — skipping revoke."
 fi
 
-# 443 = HTTPS (SSM, apt's NodeSource source, npm)
-# 80   = HTTP (Ubuntu's own default apt archives — required for real
-#        dependencies of packages installed at bootstrap, e.g. NodeSource's
-#        nodejs .deb pulling in libatomic1/gcc-14 from security.ubuntu.com)
+# 443 = HTTPS (SSM, ECR + its S3 layer downloads, CloudWatch Logs,
+#        Docker's apt repository)
+# 80   = HTTP (Ubuntu's own default apt archives — required for packages
+#        and dependencies installed at bootstrap, from
+#        <region>.ec2.archive.ubuntu.com / security.ubuntu.com)
 # 27017 = MongoDB wire protocol (the actual Atlas data connection —
 #         distinct from the DNS lookup that mongodb+srv:// uses to find it)
 # 587  = SMTP submission, upgraded to TLS via STARTTLS — AWS SES's SMTP
@@ -147,7 +148,7 @@ fi
 #        standard port for an authenticated client submitting mail.
 #        Credentials are never sent before STARTTLS completes (SES
 #        refuses AUTH on an unencrypted connection).
-for tcp_port_desc in "443:HTTPS (SSM, apt/npm)" "80:HTTP (Ubuntu package archives)" "27017:MongoDB wire protocol (Atlas)" "587:SMTP submission (AWS SES)"; do
+for tcp_port_desc in "443:HTTPS (SSM, ECR, CloudWatch Logs, apt)" "80:HTTP (Ubuntu package archives)" "27017:MongoDB wire protocol (Atlas)" "587:SMTP submission (AWS SES)"; do
   tcp_port="${tcp_port_desc%%:*}"
   tcp_desc="${tcp_port_desc#*:}"
   EGRESS_PRESENT="$(aws ec2 describe-security-groups --group-ids "$EC2_SG_ID" \

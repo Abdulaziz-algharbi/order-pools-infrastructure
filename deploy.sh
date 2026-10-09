@@ -47,6 +47,8 @@ run_step "Security groups"                  "${INFRA_ROOT}/security/01-security-
 run_step "IAM: EC2 instance role"           "${INFRA_ROOT}/iam/01-ec2-instance-role.sh" "$ENVIRONMENT"
 run_step "Backend: EC2 instance"            "${INFRA_ROOT}/backend/01-ec2-instance.sh" "$ENVIRONMENT"
 run_step "Backend: artifact bucket"         "${INFRA_ROOT}/backend/02-artifact-bucket.sh" "$ENVIRONMENT"
+run_step "Backend: ECR image repository"    "${INFRA_ROOT}/backend/05-ecr-repository.sh" "$ENVIRONMENT"
+run_step "Backend: CloudWatch log group"    "${INFRA_ROOT}/backend/06-log-group.sh" "$ENVIRONMENT"
 run_step "DNS/TLS: backend ACM certificate" "${INFRA_ROOT}/dns-tls/01-acm-backend.sh" "$ENVIRONMENT"
 run_step "Backend: target group"            "${INFRA_ROOT}/backend/03-target-group.sh" "$ENVIRONMENT"
 run_step "Backend: ALB"                     "${INFRA_ROOT}/backend/04-alb.sh" "$ENVIRONMENT"

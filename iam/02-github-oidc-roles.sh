@@ -138,7 +138,8 @@ trust_policy_for() {
 # =====================================================================
 # 2. order-pool-<env>-infra-deploy — the broadest role, since it runs
 # deploy.sh/destroy.sh, which between them touch every AWS service this
-# project uses. For a real company this would be a much larger effort
+# project uses (ECR and CloudWatch Logs included, for the backend's image
+# repository and log group). For a real company this would be a much larger effort
 # to enumerate a fully minimal action list per service; for this
 # project's scale, AWS managed "FullAccess" policies for the services it
 # owns are a deliberate, documented simplification — EXCEPT for IAM,
@@ -160,7 +161,9 @@ for policy_arn in \
   "arn:aws:iam::aws:policy/CloudFrontFullAccess" \
   "arn:aws:iam::aws:policy/AmazonRoute53FullAccess" \
   "arn:aws:iam::aws:policy/AWSCertificateManagerFullAccess" \
-  "arn:aws:iam::aws:policy/AmazonSSMFullAccess"; do
+  "arn:aws:iam::aws:policy/AmazonSSMFullAccess" \
+  "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess" \
+  "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"; do
   aws iam attach-role-policy --role-name "$INFRA_ROLE_NAME" --policy-arn "$policy_arn"
 done
 
@@ -239,7 +242,8 @@ put_output "$ENVIRONMENT" "iam/frontend-deploy-role-arn" "$FRONTEND_ROLE_ARN"
 log_info "Frontend deploy role ready: ${FRONTEND_ROLE_ARN}"
 
 # =====================================================================
-# 4. order-pool-<env>-backend-deploy — scoped to the artifact bucket,
+# 4. order-pool-<env>-backend-deploy — scoped to the artifact bucket and
+# the backend's ECR repository (pushing the image CI builds),
 # SSM commands against instances tagged for this project/environment
 # (not a specific instance ID — IDs aren't known at policy-authoring
 # time and can change if the instance is ever relaunched), and reading
@@ -254,6 +258,7 @@ BACKEND_POLICY=$(jq -n \
   --arg stateArn "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter/${PROJECT}/${ENVIRONMENT}/state/backend/*" \
   --arg secretsArn "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter/${PROJECT}/${ENVIRONMENT}/backend/*" \
   --arg documentArn "arn:aws:ssm:${AWS_REGION}::document/AWS-RunShellScript" \
+  --arg repositoryArn "arn:aws:ecr:${AWS_REGION}:${ACCOUNT_ID}:repository/${PROJECT}-${ENVIRONMENT}-backend" \
   '{
     Version: "2012-10-17",
     Statement: [
@@ -262,6 +267,21 @@ BACKEND_POLICY=$(jq -n \
         Effect: "Allow",
         Action: ["s3:PutObject"],
         Resource: "\($bucketArn)/*"
+      },
+      {
+        Sid: "GetRegistryLoginToken",
+        Effect: "Allow",
+        Action: ["ecr:GetAuthorizationToken"],
+        Resource: "*"
+      },
+      {
+        Sid: "PushImages",
+        Effect: "Allow",
+        Action: [
+          "ecr:BatchCheckLayerAvailability","ecr:InitiateLayerUpload","ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload","ecr:PutImage","ecr:BatchGetImage","ecr:DescribeImages"
+        ],
+        Resource: $repositoryArn
       },
       {
         Sid: "ResolveOwnResourceIds",
@@ -304,6 +324,14 @@ BACKEND_POLICY=$(jq -n \
     ]
   }' | sed "s/ENV_PLACEHOLDER/${ENVIRONMENT}/")
 # Notes on the statements above:
+#  - ECR: GetAuthorizationToken has no resource to scope to (see
+#    iam/01-ec2-instance-role.sh), so it's "*"; everything that touches
+#    an image is limited to this environment's one repository. A push is
+#    the four layer-upload actions plus PutImage (the tag). DescribeImages
+#    lets CI see that a commit's tag already exists and skip the push —
+#    the repository's tags are immutable (backend/05-ecr-repository.sh),
+#    so re-pushing it would fail. No delete actions: old images go only
+#    through the repository's lifecycle policy.
 #  - ssm:SendCommand needed two SEPARATE statements, not one with both
 #    resources in its Resource array — confirmed live, the combined
 #    form was denied. SendCommand touches both the target instance AND

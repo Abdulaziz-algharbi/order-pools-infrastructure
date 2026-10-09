@@ -26,6 +26,11 @@ check_account_region "$ENVIRONMENT"
 # refuses to run on a non-empty bucket anyway, so "empty first" isn't
 # optional if the goal is a clean teardown. Do not point either bucket
 # at data you'd mind losing.
+#
+# The same goes for the backend's ECR repository (deleted with every
+# image in it — each one is rebuildable from its git commit) and its
+# CloudWatch log group (deleted with its logs, at most RETENTION_DAYS
+# old anyway — see backend/06-log-group.sh).
 # =====================================================================
 
 echo
@@ -33,6 +38,7 @@ log_warn "This will PERMANENTLY destroy every AWS resource this project created 
 log_warn "  VPC, subnets, Internet Gateway, route table, security groups,"
 log_warn "  IAM role/instance profile, EC2 instance, ALB + target group,"
 log_warn "  ACM certificates, Route 53 records, S3 buckets (emptied first),"
+log_warn "  ECR image repository (with its images), CloudWatch log group (with its logs),"
 log_warn "  CloudFront distribution, SES SMTP IAM user/group."
 log_warn "This cannot be undone."
 echo
@@ -186,6 +192,32 @@ echo
 
 log_info "--- Backend artifact S3 bucket ---"
 empty_and_delete_bucket "$(get_output "$ENVIRONMENT" backend/artifact-bucket-name)" "Backend artifact"
+echo
+
+log_info "--- Backend ECR repository ---"
+# Looked up by its conventional name rather than a recorded output, like
+# the IAM role below: the name is fixed, so a missing output (e.g. state
+# lost) can't strand the repository.
+ECR_REPOSITORY_NAME="${PROJECT}-${ENVIRONMENT}-backend"
+if aws ecr describe-repositories --repository-names "$ECR_REPOSITORY_NAME" >/dev/null 2>&1; then
+  # --force deletes the images too; without it, delete-repository
+  # refuses a repository that still holds any (see the policy above).
+  log_warn "Deleting ECR repository ${ECR_REPOSITORY_NAME} and every image in it..."
+  aws ecr delete-repository --repository-name "$ECR_REPOSITORY_NAME" --force >/dev/null
+else
+  log_warn "ECR repository ${ECR_REPOSITORY_NAME} not found — skipping."
+fi
+echo
+
+log_info "--- Backend CloudWatch log group ---"
+LOG_GROUP_NAME="/${PROJECT}/${ENVIRONMENT}/backend"
+if [[ "$(aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" \
+  --query "length(logGroups[?logGroupName=='${LOG_GROUP_NAME}'])" --output text)" != "0" ]]; then
+  log_warn "Deleting log group ${LOG_GROUP_NAME} and its logs..."
+  aws logs delete-log-group --log-group-name "$LOG_GROUP_NAME"
+else
+  log_warn "Log group ${LOG_GROUP_NAME} not found — skipping."
+fi
 echo
 
 log_info "--- Backend ACM certificate (${AWS_REGION}) ---"

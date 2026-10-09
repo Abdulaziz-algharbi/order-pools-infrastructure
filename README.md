@@ -74,7 +74,7 @@ The very first script you run for a given environment prints the caller's AWS ac
 | File | Committed? | Purpose |
 |---|---|---|
 | `config/common.env` | Yes | Values shared by every environment (project name, tag keys) |
-| `config/<env>.env` | Yes | Per-environment config: region, VPC/subnet CIDRs, instance type, domain names, Node major version |
+| `config/<env>.env` | Yes | Per-environment config: region, VPC/subnet CIDRs, instance type, root volume size, domain names |
 | `config/<env>.local.env` | **No** (gitignored) | Auto-generated account pin — see above |
 | `config/<env>.secrets.env` | **No** (gitignored) | Real application secrets (Atlas URI, JWT secrets, ...) — copy from the `.example` template and fill in |
 | `environments/<env>/outputs.env` | **No** (gitignored) | Local cache of resource IDs, for fast re-runs on your own machine |
@@ -121,7 +121,9 @@ CloudFront's `CustomErrorResponses` rewrite both 403 and 404 to `/index.html` wi
 
 ## 8. Backend deployment
 
-`backend/01-ec2-instance.sh` launches a single Ubuntu 24.04 LTS instance (AMI resolved dynamically via Canonical's own SSM public parameter — never hardcoded) with a systemd unit installed but not started. `backend/deploy-backend.sh`:
+> **Migration in progress: the backend now ships as a Docker image.** The image is built from `order-pools-backend/Dockerfile`, stored in a private ECR repository (`backend/05-ecr-repository.sh`), and logs to CloudWatch Logs (`backend/06-log-group.sh`). An instance launched now gets Docker Engine and no Node.js. The release flow below (tarball, `npm ci` on the instance, systemd) is the one being replaced. Until `deploy-backend.sh`/`deploy-remote.sh.tmpl` and the GitHub workflow are switched to images, don't deploy the backend to a newly launched instance.
+
+`backend/01-ec2-instance.sh` launches a single Ubuntu 24.04 LTS instance (AMI resolved dynamically via Canonical's own SSM public parameter — never hardcoded) with an encrypted gp3 root volume of `ROOT_VOLUME_GB` and Docker Engine + the Compose plugin installed (`backend/bootstrap.sh.tmpl`), but no backend container yet. The previous, tarball-based `backend/deploy-backend.sh`:
 1. Builds `order-pools-backend` locally (`npm ci && npm run build`).
 2. Packages `package.json` + `package-lock.json` + `dist/` into a tarball — **deliberately no `node_modules`**. `bcrypt` is a native addon; installing it via `npm ci` *on the instance itself* (which `deploy-remote.sh.tmpl` does) is what guarantees the binary matches the instance's actual OS/architecture, rather than shipping one built on your laptop.
 3. Uploads the tarball to a private S3 bucket, then sends an SSM command telling the instance to pull it down, install dependencies, write its `.env` from SSM Parameter Store, atomically swap the `releases/<timestamp>` → `current` symlink, and `systemctl restart`.
@@ -250,7 +252,10 @@ Every teardown step tolerates the resource already being gone (a partial/interru
 | NAT Gateway | **$0** — deliberately not used, see architecture notes |
 | ACM certificates | $0 (always free) |
 | Route 53 hosted zone | ~$0.50/month + negligible query costs (assumes the zone already existed) |
+| EBS root volume (12 GB gp3) | ~$1/month |
 | S3 (both buckets) | Usage-based, negligible at this project's scale (a Vite build + a handful of release tarballs) |
+| ECR (backend images) | ~$0.10/GB-month stored; the lifecycle policy keeps at most 10 images (a few hundred MB, since they share layers), so cents |
+| CloudWatch Logs | ~$0.50/GB ingested + ~$0.03/GB-month stored, 14-day retention — cents at dev's volume |
 | CloudFront | Usage-based; PriceClass_100 (NA/EU only) keeps it cheap, and the free tier covers meaningful traffic before any charge |
 | MongoDB Atlas M0 | $0 (free tier) |
 | Amazon SES | ~$0.10 per 1,000 emails sent from EC2 — effectively $0 at this project's volume |
@@ -259,7 +264,7 @@ Rough total for a `dev` environment left running continuously: **~$35-40/month**
 
 ## 18. Security considerations
 
-- **No NAT Gateway; EC2 in a public subnet.** The security group is the sole network boundary: inbound allowed only from the ALB's security group (never a CIDR, never SSH), outbound limited to 443/tcp (HTTPS — SSM, apt's NodeSource source, npm), 587/tcp (SMTP submission with STARTTLS to AWS SES — see [Email (AWS SES)](#19-email-aws-ses)), 80/tcp (HTTP — Ubuntu's own default apt archives; required in practice, since GPG-signed dependencies of packages installed at bootstrap, e.g. NodeSource's nodejs .deb pulling in libatomic1/gcc-14, are served from Ubuntu's plain-HTTP mirrors — apt verifies package integrity via signed release indices regardless of transport, so this doesn't weaken package integrity), 27017/tcp (MongoDB's wire protocol — the actual Atlas data connection, distinct from the DNS lookup `mongodb+srv://` uses to find it), and DNS (53/tcp+udp) scoped to the VPC CIDR only. None of these are narrowed to a smaller CIDR than `0.0.0.0/0`, because neither Ubuntu's mirrors, Atlas's cluster nodes, nor SES's SMTP endpoint publish a small, stable IP range to pin instead — the real security boundary for Atlas is its own Network Access allow-list and DB credentials, not this security group. This trades one layer of defense-in-depth (no network path to the instance at all) for real monthly savings, on the premise that the security group is airtight. Revisit for an environment with a lower risk tolerance for that trade-off.
+- **No NAT Gateway; EC2 in a public subnet.** The security group is the sole network boundary: inbound allowed only from the ALB's security group (never a CIDR, never SSH), outbound limited to 443/tcp (HTTPS — SSM, ECR image pulls and their S3 layer downloads, CloudWatch Logs, Docker's apt repository), 587/tcp (SMTP submission with STARTTLS to AWS SES — see [Email (AWS SES)](#19-email-aws-ses)), 80/tcp (HTTP — Ubuntu's own default apt archives; required in practice, since the packages bootstrap installs and their dependencies (ca-certificates, curl, jq, Docker's dependencies) are served from Ubuntu's plain-HTTP mirrors — apt verifies package integrity via signed release indices regardless of transport, so this doesn't weaken package integrity), 27017/tcp (MongoDB's wire protocol — the actual Atlas data connection, distinct from the DNS lookup `mongodb+srv://` uses to find it), and DNS (53/tcp+udp) scoped to the VPC CIDR only. None of these are narrowed to a smaller CIDR than `0.0.0.0/0`, because neither Ubuntu's mirrors, Atlas's cluster nodes, nor SES's SMTP endpoint publish a small, stable IP range to pin instead — the real security boundary for Atlas is its own Network Access allow-list and DB credentials, not this security group. This trades one layer of defense-in-depth (no network path to the instance at all) for real monthly savings, on the premise that the security group is airtight. Revisit for an environment with a lower risk tolerance for that trade-off.
 - **One long-lived AWS credential, by necessity: the SES SMTP key.** SES's SMTP interface only accepts credentials derived from an IAM user's access key — it can't use the instance role. `email/01-ses.sh` confines it to a dedicated IAM user whose only permission (via a group, per AWS's current guidance) is `ses:SendRawEmail` from exactly `SES_FROM_ADDRESS`, and it's stored only in the gitignored secrets file and an SSM `SecureString`. Rotate by re-running the script with the old key removed from the secrets file, then deleting the old key once redeployed.
 - **No SSH, anywhere.** All administration is SSM Session Manager / Run Command, both authenticated via IAM, both leaving a CloudTrail-auditable record of who ran what — a meaningfully better audit story than SSH key access even setting aside the "no open port" benefit.
 - **IMDSv2 enforced** (`HttpTokens=required`) on the instance, closing the classic SSRF-to-stolen-instance-credentials path IMDSv1 is vulnerable to.

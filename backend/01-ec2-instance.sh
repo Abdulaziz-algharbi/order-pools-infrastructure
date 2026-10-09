@@ -49,11 +49,17 @@ else
     --query 'Parameters[0].Value' --output text)"
   log_info "Using AMI: ${AMI_ID}"
 
-  log_info "Rendering bootstrap user-data for Node ${NODE_MAJOR_VERSION}.x, backend port ${BACKEND_PORT}..."
+  # The root volume's device name differs between AMIs (/dev/sda1 for
+  # Ubuntu, /dev/xvda for Amazon Linux), so it's read from the AMI rather
+  # than assumed — a mapping for the wrong name would attach a second,
+  # empty volume instead of resizing the root one.
+  ROOT_DEVICE_NAME="$(aws ec2 describe-images --image-ids "$AMI_ID" \
+    --query 'Images[0].RootDeviceName' --output text)"
+
+  log_info "Rendering bootstrap user-data (Docker Engine; backend port ${BACKEND_PORT})..."
   USER_DATA_FILE="$(mktemp)"
   trap 'rm -f "$USER_DATA_FILE"' EXIT
   sed \
-    -e "s|__NODE_MAJOR_VERSION__|${NODE_MAJOR_VERSION}|g" \
     -e "s|__PROJECT__|${PROJECT}|g" \
     "${SCRIPT_DIR}/bootstrap.sh.tmpl" > "$USER_DATA_FILE"
 
@@ -65,9 +71,18 @@ else
   # of depending silently on subnet-level state alone.
   # --user-data runs bootstrap.sh.tmpl (rendered above) once, on first
   # boot only, as root, via cloud-init.
+  # --block-device-mappings sizes the root volume (ROOT_VOLUME_GB in
+  # config/<env>.env — room for Docker images), as gp3, encrypted at rest,
+  # and deleted with the instance so a terminated instance leaves no
+  # billable volume behind.
   # --metadata-options HttpTokens=required enforces IMDSv2 (token-based
   # instance metadata requests), closing off the classic SSRF-to-stolen-
-  # credentials path that IMDSv1 is vulnerable to.
+  # credentials path that IMDSv1 is vulnerable to. The hop limit stays at
+  # its default of 1, which also means a process INSIDE a Docker container
+  # (one network hop further) can't get the instance role's credentials —
+  # only the host can (the Docker daemon's awslogs driver, the deploy
+  # script). The backend doesn't call AWS APIs itself; if it ever does
+  # (e.g. a queue client), raise it to 2 deliberately at that point.
   INSTANCE_ID="$(aws ec2 run-instances \
     --image-id "$AMI_ID" \
     --instance-type "$INSTANCE_TYPE" \
@@ -76,6 +91,7 @@ else
     --iam-instance-profile "Name=${INSTANCE_PROFILE_NAME}" \
     --associate-public-ip-address \
     --user-data "file://${USER_DATA_FILE}" \
+    --block-device-mappings "DeviceName=${ROOT_DEVICE_NAME},Ebs={VolumeSize=${ROOT_VOLUME_GB},VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}" \
     --metadata-options "HttpTokens=required" \
     --tag-specifications "$(tag_spec instance "$INSTANCE_NAME")" \
     --query 'Instances[0].InstanceId' --output text)"
@@ -107,6 +123,6 @@ log_info "No SSH is exposed — to look at the bootstrap log, use SSM Session Ma
 log_info "  aws ssm start-session --target ${INSTANCE_ID}"
 log_info "  (then, on the instance) cat /var/log/order-pool-bootstrap.log"
 log_info ""
-log_info "Node.js and the systemd unit are installed, but the service is NOT started —"
-log_info "there is no application code on the instance until Phase 3's deploy-backend.sh runs."
+log_info "Docker is installed and running, but there is no backend container on the"
+log_info "instance until deploy-backend.sh pulls the image and starts it."
 log_info "Next (Phase 3): backend/02-target-group.sh and backend/03-alb.sh."

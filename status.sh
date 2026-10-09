@@ -88,6 +88,22 @@ else
   row "Backend ACM certificate" "<none>"
 fi
 
+ECR_REPOSITORY_NAME="${PROJECT}-${ENVIRONMENT}-backend"
+if aws ecr describe-repositories --repository-names "$ECR_REPOSITORY_NAME" >/dev/null 2>&1; then
+  IMAGE_COUNT="$(aws ecr describe-images --repository-name "$ECR_REPOSITORY_NAME" --query 'length(imageDetails)' --output text 2>/dev/null || echo "?")"
+  row "ECR repository" "${ECR_REPOSITORY_NAME} (${IMAGE_COUNT} images)"
+else
+  row "ECR repository" "<none>"
+fi
+
+LOG_GROUP_NAME="/${PROJECT}/${ENVIRONMENT}/backend"
+if [[ "$(aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" \
+  --query "length(logGroups[?logGroupName=='${LOG_GROUP_NAME}'])" --output text 2>/dev/null || echo 0)" != "0" ]]; then
+  row "CloudWatch log group" "$LOG_GROUP_NAME"
+else
+  row "CloudWatch log group" "<none>"
+fi
+
 LAST_RELEASE="$(get_output "$ENVIRONMENT" backend/last-release-id)"
 row "Last deployed release" "${LAST_RELEASE:-<none yet>}"
 
