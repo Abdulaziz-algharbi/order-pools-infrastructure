@@ -137,7 +137,7 @@ The backend ships as a **Docker image** built from `order-pools-backend/Dockerfi
    - prunes old images, keeping the 3 most recently deployed.
 4. Polls the ALB target group until it reports healthy.
 
-On the instance, Docker (not systemd) keeps the backend running: the container has `restart: unless-stopped`, and the Docker service starts on boot. The container's stdout goes to CloudWatch Logs (`backend/06-log-group.sh`, 14-day retention), one stream per deploy: `aws logs tail /order-pool/<env>/backend --follow`. On stop, Docker sends `SIGTERM`, which `order-pools-backend/src/server.ts` handles to close the HTTP server and the Mongo connection cleanly.
+On the instance, Docker (not systemd) keeps the backend running: the container has `restart: unless-stopped`, and the Docker service starts on boot. The container's stdout goes to CloudWatch Logs (`backend/06-log-group.sh`, retention `LOG_RETENTION_DAYS`, 7 days in dev), one stream per deploy: `aws logs tail /order-pool/<env>/backend --follow`. On stop, Docker sends `SIGTERM`, which `order-pools-backend/src/server.ts` handles to close the HTTP server and the Mongo connection cleanly.
 
 This is **pull-based**: the instance pulls the image and reads its parameters over its own IAM role; nothing is ever pushed to it over SSH (there is no SSH — administration is SSM Session Manager only).
 
@@ -165,7 +165,7 @@ order-pool-<env>-backend-deploy    -> scoped to the artifact bucket + ssm:SendCo
 
 **Workflows**, one per app repo (deliberately none in `order-pools-infrastructure` itself):
 
-- `order-pools-backend/.github/workflows/deploy.yml` — runs the unit tests, builds the Docker image, runs the whole API suite against that image (with a MongoDB replica set started from the repo's `docker-compose.yml`), pushes it to ECR as `:<commit SHA>`, then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` with that tag to do the actual render/SSM-send/poll mechanics.
+- `order-pools-backend/.github/workflows/deploy.yml` — runs the unit tests, builds the Docker image, runs the whole API suite against that image (with a MongoDB replica set started from the repo's `docker-compose.yml`), pushes it to ECR as `:<commit SHA>` (skipped, with a warning, when the environment is destroyed), then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` with that tag to do the actual render/SSM-send/poll mechanics.
 - `order-pools-app/.github/workflows/deploy.yml` — fully self-contained: build (with `VITE_API_BASE_URL` injected the same way `deploy-frontend.sh` does), `s3 sync` (two-pass cache headers), CloudFront invalidation, no cross-repo call.
 
 Both trigger on **push to `main`** (real continuous deployment) as well as manual `workflow_dispatch`, and both are confirmed working end-to-end against the live `dev` environment.
@@ -262,18 +262,19 @@ Every teardown step tolerates the resource already being gone (a partial/interru
 |---|---|
 | EC2 `t3.small` (on-demand, running 24/7) | ~$15/month |
 | Application Load Balancer | ~$18-20/month (hourly + LCU usage) |
+| Public IPv4 addresses (the ALB's two, one per subnet, + the instance's) | ~$11/month ($0.005/hour each) |
 | NAT Gateway | **$0** — deliberately not used, see architecture notes |
 | ACM certificates | $0 (always free) |
 | Route 53 hosted zone | ~$0.50/month + negligible query costs (assumes the zone already existed) |
 | EBS root volume (12 GB gp3) | ~$1/month |
 | S3 (both buckets) | Usage-based, negligible at this project's scale (a Vite build + a handful of release tarballs) |
-| ECR (backend images) | ~$0.10/GB-month stored; the lifecycle policy keeps at most 10 images (a few hundred MB, since they share layers), so cents |
-| CloudWatch Logs | ~$0.50/GB ingested + ~$0.03/GB-month stored, 14-day retention — cents at dev's volume |
+| ECR (backend images) | ~$0.10/GB-month stored; the lifecycle policy keeps at most `ECR_KEEP_IMAGES` images (5 in dev; a few hundred MB, since they share layers), so cents |
+| CloudWatch Logs | ~$0.50/GB ingested + ~$0.03/GB-month stored, `LOG_RETENTION_DAYS` retention (7 in dev) — cents at dev's volume |
 | CloudFront | Usage-based; PriceClass_100 (NA/EU only) keeps it cheap, and the free tier covers meaningful traffic before any charge |
 | MongoDB Atlas M0 | $0 (free tier) |
 | Amazon SES | ~$0.10 per 1,000 emails sent from EC2 — effectively $0 at this project's volume |
 
-Rough total for a `dev` environment left running continuously: **~$35-40/month**, dominated by the ALB and EC2, not by anything data-transfer-related. Running `./destroy.sh dev` between periods of active use (e.g. between demos) avoids paying for idle infrastructure — nothing here needs to stay up permanently just to preserve state, since all durable state is either in Atlas (external) or reproducible from `order-pools-app`/`order-pools-backend`'s own git history.
+Rough total for a `dev` environment left running continuously: **~$45-50/month**, dominated by the ALB (with its IPv4 addresses) and EC2, not by anything data-transfer-related. Running `./destroy.sh dev` between periods of active use (e.g. between demos) avoids paying for idle infrastructure — nothing here needs to stay up permanently just to preserve state, since all durable state is either in Atlas (external) or reproducible from `order-pools-app`/`order-pools-backend`'s own git history. Destroyed, dev costs only the Route 53 hosted zone (~$0.50/month): `destroy.sh` ends by listing anything still tagged with the environment (in its region and us-east-1), plus any unattached EBS volume or unassociated Elastic IP in the region, so a leftover shows up there rather than on the bill. While dev is destroyed, a push to `order-pools-backend` still runs its tests in CI, then skips the push and deploy with a warning.
 
 ## 18. Security considerations
 

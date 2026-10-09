@@ -21,6 +21,7 @@ check_account_region "$ENVIRONMENT"
 # Same name iam/01-ec2-instance-role.sh and iam/02-github-oidc-roles.sh
 # scope their ECR permissions to.
 REPOSITORY_NAME="${PROJECT}-${ENVIRONMENT}-backend"
+KEEP_IMAGES="${ECR_KEEP_IMAGES:?Set ECR_KEEP_IMAGES in config/${ENVIRONMENT}.env}"
 
 # --- What this repository is for ---------------------------------------
 # The backend ships as a Docker image (order-pools-backend/Dockerfile),
@@ -65,12 +66,12 @@ fi
 # Cost/hygiene, same idea as the artifact bucket's 30-day rule: ECR
 # charges for storage (~$0.10/GB-month), and every push adds an image.
 # Rule 1 removes untagged images (layers left behind when a build fails
-# mid-push) after a day; rule 2 keeps the 10 most recent images and
-# expires older ones — far more rollback depth than a dev environment
-# needs, and only a few hundred MB in total since images share layers.
+# mid-push) after a day; rule 2 keeps the ECR_KEEP_IMAGES most recent
+# images (config/<env>.env) and expires older ones. Images share their
+# base layers, so a few of them are a few hundred MB in total.
 # Rules are evaluated in rulePriority order, lowest first.
-log_info "Applying lifecycle policy (untagged: 1 day; keep the 10 newest images)..."
-LIFECYCLE_POLICY=$(jq -n '{
+log_info "Applying lifecycle policy (untagged: 1 day; keep the ${KEEP_IMAGES} newest images)..."
+LIFECYCLE_POLICY=$(jq -n --argjson keep "$KEEP_IMAGES" '{
   rules: [
     {
       rulePriority: 1,
@@ -80,8 +81,8 @@ LIFECYCLE_POLICY=$(jq -n '{
     },
     {
       rulePriority: 2,
-      description: "Keep only the 10 most recent images",
-      selection: { tagStatus: "any", countType: "imageCountMoreThan", countNumber: 10 },
+      description: "Keep only the \($keep) most recent images",
+      selection: { tagStatus: "any", countType: "imageCountMoreThan", countNumber: $keep },
       action: { type: "expire" }
     }
   ]

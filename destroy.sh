@@ -357,6 +357,56 @@ else
 fi
 rm -f "${INFRA_ROOT}/environments/${ENVIRONMENT}/outputs.env"
 log_info "Cleared local outputs cache for '${ENVIRONMENT}'."
+echo
+
+log_info "--- Checking for anything left that could still cost money ---"
+# Every step above deletes what it knows about. This looks the other
+# way round: what does AWS still have that carries this environment's
+# tags (Project/Environment, set on everything this project creates)?
+# It's what would otherwise show up on next month's bill. Both regions:
+# the frontend's certificate and CloudFront are in us-east-1. A resource
+# deleted moments ago can still be listed for a few minutes; one that's
+# still there on a re-run of ./status.sh is a real leftover.
+LEFTOVERS=0
+for region in "$AWS_REGION" us-east-1; do
+  for arn in $(aws resourcegroupstaggingapi get-resources --region "$region" \
+      --tag-filters "Key=Project,Values=${PROJECT}" "Key=Environment,Values=${ENVIRONMENT}" \
+      --query 'ResourceTagMappingList[].ResourceARN' --output text 2>/dev/null || true); do
+    # IAM is free, and the GitHub OIDC roles (iam/02-github-oidc-roles.sh)
+    # are deliberately kept; the IAM this script deletes is checked above.
+    [[ "$arn" == arn:aws:iam::* ]] && continue
+    # A terminated instance stays visible (and tagged) for about an hour,
+    # but it costs nothing and goes away by itself.
+    if [[ "$arn" == *":instance/"* ]]; then
+      state="$(aws ec2 describe-instances --region "$region" --instance-ids "${arn##*/}" \
+        --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "not-found")"
+      [[ "$state" == "terminated" || "$state" == "not-found" ]] && continue
+    fi
+    log_warn "Still exists: ${arn}"
+    LEFTOVERS=$((LEFTOVERS + 1))
+  done
+done
+# Two classic leftovers that cost money without anything else around
+# them, and needn't carry this project's tags: an EBS volume attached to
+# nothing (the instance's root volume is deleted with it, but a volume
+# made by hand isn't) and an Elastic IP associated with nothing
+# ($0.005/hour). Listed for the whole region, since either is billed
+# whoever made it.
+for vol in $(aws ec2 describe-volumes --filters Name=status,Values=available \
+    --query 'Volumes[].VolumeId' --output text 2>/dev/null || true); do
+  log_warn "Unattached EBS volume in ${AWS_REGION}: ${vol} (aws ec2 delete-volume --volume-id ${vol})"
+  LEFTOVERS=$((LEFTOVERS + 1))
+done
+for alloc in $(aws ec2 describe-addresses --query 'Addresses[?AssociationId==`null`].AllocationId' \
+    --output text 2>/dev/null || true); do
+  log_warn "Unassociated Elastic IP in ${AWS_REGION}: ${alloc} (aws ec2 release-address --allocation-id ${alloc})"
+  LEFTOVERS=$((LEFTOVERS + 1))
+done
+if [[ "$LEFTOVERS" -eq 0 ]]; then
+  log_info "Nothing left. What remains is outside this environment: the Route 53 hosted zone (~\$0.50/month), the SES identity and the GitHub OIDC roles (free)."
+else
+  log_warn "${LEFTOVERS} resource(s) above still exist — re-run ./destroy.sh ${ENVIRONMENT}, or delete them by hand."
+fi
 
 echo
 log_info "=========================================="

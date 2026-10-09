@@ -21,7 +21,7 @@ check_account_region "$ENVIRONMENT"
 # Same name iam/01-ec2-instance-role.sh scopes the instance's
 # logs:PutLogEvents permission to.
 LOG_GROUP_NAME="/${PROJECT}/${ENVIRONMENT}/backend"
-RETENTION_DAYS=14
+RETENTION_DAYS="${LOG_RETENTION_DAYS:?Set LOG_RETENTION_DAYS in config/${ENVIRONMENT}.env}"
 
 # --- What this log group is for ----------------------------------------
 # In a container the backend logs only to stdout (order-pools-backend's
@@ -35,8 +35,9 @@ RETENTION_DAYS=14
 # The group is created here rather than by the driver
 # (awslogs-create-group=true) so it gets a retention period: a group the
 # driver creates keeps logs forever, and CloudWatch bills storage
-# (~$0.03/GB-month) on top of ingestion (~$0.50/GB). 14 days is enough to
-# investigate a problem from last week; dev's volume is tiny either way.
+# (~$0.03/GB-month) on top of ingestion (~$0.50/GB). How long is
+# LOG_RETENTION_DAYS (config/<env>.env): dev keeps a week. Re-running
+# this script applies a changed value to the existing group.
 
 log_info "Checking for an existing log group ${LOG_GROUP_NAME}..."
 EXISTING="$(aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" \

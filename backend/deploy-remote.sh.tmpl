@@ -63,9 +63,18 @@ echo "--- Pulling the image from ECR ---"
 # 12-hour registry token. `docker login` stores it in root's
 # ~/.docker/config.json; logging out once the pull is done keeps it off
 # disk. Nothing needs it again until the next deploy pulls.
+#
+# ECR keeps only the newest ECR_KEEP_IMAGES images (05-ecr-repository.sh),
+# so an older one rolled back to may be gone from ECR while still on
+# disk here: then the local copy is used. (An image ID is the hash of
+# its content, so the local copy is exactly what was pushed.)
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "$REGISTRY"
-docker pull "$IMAGE"
+if ! docker pull "$IMAGE"; then
+  docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || { docker logout "$REGISTRY"; echo "${IMAGE} is neither in ECR nor on this instance." >&2; exit 1; }
+  echo "Could not pull ${IMAGE} (expired from ECR?) — using the copy on this instance."
+fi
 docker logout "$REGISTRY"
 
 echo "--- Writing environment file from SSM Parameter Store ---"
