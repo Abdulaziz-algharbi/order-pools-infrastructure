@@ -148,12 +148,20 @@ if [[ -n "$INSTANCE_ID" && "$INSTANCE_ID" != "None" ]]; then
   check_eq "IMDSv2 enforced (HttpTokens=required)" "$IMDS_TOKENS" "required"
 fi
 
-ARTIFACT_BUCKET="$(get_output "$ENVIRONMENT" backend/artifact-bucket-name)"
-check_nonempty "Artifact bucket recorded" "$ARTIFACT_BUCKET"
-if [[ -n "$ARTIFACT_BUCKET" && "$ARTIFACT_BUCKET" != "None" ]]; then
-  if aws s3api head-bucket --bucket "$ARTIFACT_BUCKET" >/dev/null 2>&1; then pass "Artifact bucket is accessible"; else fail "Artifact bucket is not accessible"; fi
-  ARTIFACT_PAB="$(aws s3api get-public-access-block --bucket "$ARTIFACT_BUCKET" --query 'PublicAccessBlockConfiguration.BlockPublicAcls' --output text 2>/dev/null || echo "false")"
-  check_eq "Artifact bucket blocks public access" "$ARTIFACT_PAB" "True"
+ECR_REPOSITORY_NAME="$(get_output "$ENVIRONMENT" backend/ecr-repository-name)"
+check_nonempty "ECR repository recorded" "$ECR_REPOSITORY_NAME"
+if [[ -n "$ECR_REPOSITORY_NAME" && "$ECR_REPOSITORY_NAME" != "None" ]]; then
+  ECR_MUTABILITY="$(aws ecr describe-repositories --repository-names "$ECR_REPOSITORY_NAME" --query 'repositories[0].imageTagMutability' --output text 2>/dev/null || echo "")"
+  check_eq "ECR repository tags are immutable" "$ECR_MUTABILITY" "IMMUTABLE"
+  if aws ecr get-lifecycle-policy --repository-name "$ECR_REPOSITORY_NAME" >/dev/null 2>&1; then pass "ECR repository has a lifecycle policy"; else fail "ECR repository has no lifecycle policy"; fi
+fi
+
+LOG_GROUP_NAME="$(get_output "$ENVIRONMENT" backend/log-group-name)"
+check_nonempty "CloudWatch log group recorded" "$LOG_GROUP_NAME"
+if [[ -n "$LOG_GROUP_NAME" && "$LOG_GROUP_NAME" != "None" ]]; then
+  LOG_RETENTION="$(aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP_NAME" \
+    --query "logGroups[?logGroupName=='${LOG_GROUP_NAME}'].retentionInDays | [0]" --output text 2>/dev/null || echo "")"
+  check_eq "Log group retention is ${LOG_RETENTION_DAYS} days" "$LOG_RETENTION" "$LOG_RETENTION_DAYS"
 fi
 
 echo

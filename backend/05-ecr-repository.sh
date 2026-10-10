@@ -27,9 +27,9 @@ KEEP_IMAGES="${ECR_KEEP_IMAGES:?Set ECR_KEEP_IMAGES in config/${ENVIRONMENT}.env
 # The backend ships as a Docker image (order-pools-backend/Dockerfile),
 # not a tarball. GitHub Actions builds it once, runs the tests against
 # that exact image, and pushes it here tagged with the git commit SHA.
-# The EC2 instance then pulls it over its own IAM role — the same
-# pull-based model as the S3 artifact bucket: nothing is pushed to the
-# instance, and the registry is private (no public pull, ever).
+# The EC2 instance then pulls it over its own IAM role: nothing is
+# pushed to the instance, and the registry is private (no public pull,
+# ever).
 #
 # ECR (Elastic Container Registry) is AWS's private Docker registry.
 # Unlike Docker Hub it authenticates with IAM, so neither CI (OIDC role)
@@ -63,8 +63,8 @@ else
     >/dev/null
 fi
 
-# Cost/hygiene, same idea as the artifact bucket's 30-day rule: ECR
-# charges for storage (~$0.10/GB-month), and every push adds an image.
+# Cost/hygiene: ECR charges for storage (~$0.10/GB-month), and every
+# push adds an image.
 # Rule 1 removes untagged images (layers left behind when a build fails
 # mid-push) after a day; rule 2 keeps the ECR_KEEP_IMAGES most recent
 # images (config/<env>.env) and expires older ones. Images share their

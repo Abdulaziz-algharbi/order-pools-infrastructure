@@ -13,9 +13,6 @@ environments/*/outputs.env
 # (with blank values) is tracked.
 config/*.secrets.env
 
-# Backend build artifacts staged locally before upload to S3
-backend/.build/
-
 # Anything generated locally while testing
 *.pem
 .DS_Store

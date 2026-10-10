@@ -242,8 +242,8 @@ put_output "$ENVIRONMENT" "iam/frontend-deploy-role-arn" "$FRONTEND_ROLE_ARN"
 log_info "Frontend deploy role ready: ${FRONTEND_ROLE_ARN}"
 
 # =====================================================================
-# 4. order-pool-<env>-backend-deploy — scoped to the artifact bucket and
-# the backend's ECR repository (pushing the image CI builds),
+# 4. order-pool-<env>-backend-deploy — scoped to the backend's ECR
+# repository (pushing the image CI builds),
 # SSM commands against instances tagged for this project/environment
 # (not a specific instance ID — IDs aren't known at policy-authoring
 # time and can change if the instance is ever relaunched), and reading
@@ -254,7 +254,6 @@ BACKEND_ROLE_NAME="${PROJECT}-${ENVIRONMENT}-backend-deploy"
 create_or_update_role "$BACKEND_ROLE_NAME" "$(trust_policy_for "$GITHUB_BACKEND_REPO")"
 
 BACKEND_POLICY=$(jq -n \
-  --arg bucketArn "arn:aws:s3:::${PROJECT}-${ENVIRONMENT}-backend-artifacts" \
   --arg stateArn "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter/${PROJECT}/${ENVIRONMENT}/state/backend/*" \
   --arg secretsArn "arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter/${PROJECT}/${ENVIRONMENT}/backend/*" \
   --arg documentArn "arn:aws:ssm:${AWS_REGION}::document/AWS-RunShellScript" \
@@ -262,12 +261,6 @@ BACKEND_POLICY=$(jq -n \
   '{
     Version: "2012-10-17",
     Statement: [
-      {
-        Sid: "UploadReleaseArtifacts",
-        Effect: "Allow",
-        Action: ["s3:PutObject"],
-        Resource: "\($bucketArn)/*"
-      },
       {
         Sid: "GetRegistryLoginToken",
         Effect: "Allow",

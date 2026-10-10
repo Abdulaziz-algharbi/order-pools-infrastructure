@@ -28,8 +28,8 @@ SECRETS_FILE="${INFRA_ROOT}/config/${ENVIRONMENT}.secrets.env"
 # AWS-managed `alias/aws/ssm` key, and readable only by a caller with
 # ssm:GetParameter — which, on the EC2 side, is exactly and only the
 # scoped policy iam/01-ec2-instance-role.sh attached to this instance's
-# role. Nothing is ever written into a bash script, a systemd unit file
-# committed to git, or a Docker image layer.
+# role. Nothing is ever written into a script or compose file committed
+# to git, or into a Docker image layer.
 log_info "Pushing ${SECRETS_FILE} into SSM Parameter Store under /${PROJECT}/${ENVIRONMENT}/backend/..."
 
 PUSHED_COUNT=0

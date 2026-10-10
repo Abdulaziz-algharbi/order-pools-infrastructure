@@ -19,13 +19,12 @@ check_account_region "$ENVIRONMENT"
 
 # =====================================================================
 # S3 BUCKET DESTRUCTION POLICY (documented per project requirement):
-# this script ALWAYS empties and then deletes every bucket it created
-# (the frontend site bucket and the backend artifact bucket). Both hold
-# only rebuildable output — a Vite build and release tarballs — never
-# anything this project treats as a system of record. `delete-bucket`
-# refuses to run on a non-empty bucket anyway, so "empty first" isn't
-# optional if the goal is a clean teardown. Do not point either bucket
-# at data you'd mind losing.
+# this script ALWAYS empties and then deletes the frontend site bucket,
+# the only bucket this project creates. It holds only rebuildable
+# output — a Vite build — never anything this project treats as a
+# system of record. `delete-bucket` refuses to run on a non-empty bucket
+# anyway, so "empty first" isn't optional if the goal is a clean
+# teardown. Do not point the bucket at data you'd mind losing.
 #
 # The same goes for the backend's ECR repository (deleted with every
 # image in it — each one is rebuildable from its git commit) and its
@@ -37,7 +36,7 @@ echo
 log_warn "This will PERMANENTLY destroy every AWS resource this project created for environment '${ENVIRONMENT}':"
 log_warn "  VPC, subnets, Internet Gateway, route table, security groups,"
 log_warn "  IAM role/instance profile, EC2 instance, ALB + target group,"
-log_warn "  ACM certificates, Route 53 records, S3 buckets (emptied first),"
+log_warn "  ACM certificates, Route 53 records, the frontend S3 bucket (emptied first),"
 log_warn "  ECR image repository (with its images), CloudWatch log group (with its logs),"
 log_warn "  CloudFront distribution, SES SMTP IAM user/group."
 log_warn "This cannot be undone."
@@ -188,10 +187,6 @@ if [[ -n "$INSTANCE_ID" && "$INSTANCE_ID" != "None" ]]; then
 else
   log_warn "No EC2 instance recorded — skipping."
 fi
-echo
-
-log_info "--- Backend artifact S3 bucket ---"
-empty_and_delete_bucket "$(get_output "$ENVIRONMENT" backend/artifact-bucket-name)" "Backend artifact"
 echo
 
 log_info "--- Backend ECR repository ---"

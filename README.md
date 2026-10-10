@@ -43,7 +43,7 @@ VPC -> Internet Gateway -> public subnets (2 AZs) -> route table
   -> security groups (ALB-SG, backend-SG)
   -> IAM (EC2 instance role + profile)
   -> EC2 instance
-  -> artifact S3 bucket
+  -> ECR image repository, CloudWatch log group
   -> ACM cert (api.<domain>, regional)
   -> target group -> ALB (HTTPS:443 + HTTP:80 redirect)
   -> Route 53 record for api.<domain>
@@ -121,7 +121,7 @@ CloudFront's `CustomErrorResponses` rewrite both 403 and 404 to `/index.html` wi
 
 ## 8. Backend deployment
 
-The backend ships as a **Docker image** built from `order-pools-backend/Dockerfile`. It is built once, tested, pushed to a private ECR repository (`backend/05-ecr-repository.sh`) tagged with its git commit SHA, and pulled by the instance. Nothing is compiled or installed on the instance at deploy time, so what runs there is byte-for-byte what was tested. The previous flow (a tarball of `dist/`, `npm ci` on the instance, a systemd unit) is gone; the S3 artifact bucket is no longer used by deploys and will be removed.
+The backend ships as a **Docker image** built from `order-pools-backend/Dockerfile`. It is built once, tested, pushed to a private ECR repository (`backend/05-ecr-repository.sh`) tagged with its git commit SHA, and pulled by the instance. Nothing is compiled or installed on the instance at deploy time, so what runs there is byte-for-byte what was tested. It replaced an earlier flow that uploaded a tarball of `dist/` to an S3 bucket for the instance to download, then ran `npm ci` there under a systemd unit; that bucket and its permissions are gone, and the backend uses no S3 at all.
 
 `backend/01-ec2-instance.sh` launches a single Ubuntu 24.04 LTS instance (AMI resolved dynamically via Canonical's own SSM public parameter — never hardcoded) with an encrypted gp3 root volume of `ROOT_VOLUME_GB` and Docker Engine + the Compose plugin installed (`backend/bootstrap.sh.tmpl`). There's no Node.js on it: the Node version is the image's.
 
@@ -156,7 +156,7 @@ Implemented (Phase 6). `iam/02-github-oidc-roles.sh <env>` creates one OIDC iden
 order-pool-<env>-infra-deploy      -> broad (could create/destroy the whole stack); provisioned but
                                        DELIBERATELY not used by any workflow — see below
 order-pool-<env>-frontend-deploy   -> scoped to the frontend S3 bucket + CreateInvalidation; trusted by order-pools-app
-order-pool-<env>-backend-deploy    -> scoped to the artifact bucket + ssm:SendCommand on Project/Environment-tagged
+order-pool-<env>-backend-deploy    -> scoped to the backend's ECR repository (push) + ssm:SendCommand on Project/Environment-tagged
                                        instances + read of /order-pool/<env>/state/backend/* and .../backend/*;
                                        trusted by order-pools-backend
 ```
@@ -250,7 +250,7 @@ Both work because the instance's IAM role (`iam/01-ec2-instance-role.sh`) has `A
 
 Tears down everything `deploy.sh` created, in reverse dependency order, and requires typing the environment name itself (not just "yes") to confirm — this is the one command in the whole toolkit with that extra friction, because it's the one that's genuinely irreversible.
 
-**Documented S3 policy**: both S3 buckets (frontend site, backend artifacts) are always emptied and then deleted. Neither is meant to hold anything but rebuildable output (a Vite build, release tarballs) — there is no "keep the bucket" option, and `delete-bucket` refuses to run on a non-empty bucket regardless. Don't repurpose either bucket for data you'd mind losing.
+**Documented S3 policy**: the frontend site bucket, the project's only S3 bucket, is always emptied and then deleted. It holds nothing but rebuildable output (a Vite build) — there is no "keep the bucket" option, and `delete-bucket` refuses to run on a non-empty bucket regardless. Don't repurpose it for data you'd mind losing. The same goes for the ECR repository (deleted with its images, each rebuildable from its commit) and the CloudWatch log group (deleted with its logs).
 
 Every teardown step tolerates the resource already being gone (a partial/interrupted destroy, or something removed by hand in the console) rather than hard-failing — re-running `destroy.sh` after any failure is always safe. It also wipes every SSM parameter under `/order-pool/<env>/` (state *and* secrets), so a destroyed environment doesn't leave an Atlas password sitting in Parameter Store.
 
@@ -267,7 +267,7 @@ Every teardown step tolerates the resource already being gone (a partial/interru
 | ACM certificates | $0 (always free) |
 | Route 53 hosted zone | ~$0.50/month + negligible query costs (assumes the zone already existed) |
 | EBS root volume (12 GB gp3) | ~$1/month |
-| S3 (both buckets) | Usage-based, negligible at this project's scale (a Vite build + a handful of release tarballs) |
+| S3 (frontend bucket) | Usage-based, negligible at this project's scale (a Vite build) |
 | ECR (backend images) | ~$0.10/GB-month stored; the lifecycle policy keeps at most `ECR_KEEP_IMAGES` images (5 in dev; a few hundred MB, since they share layers), so cents |
 | CloudWatch Logs | ~$0.50/GB ingested + ~$0.03/GB-month stored, `LOG_RETENTION_DAYS` retention (7 in dev) — cents at dev's volume |
 | CloudFront | Usage-based; PriceClass_100 (NA/EU only) keeps it cheap, and the free tier covers meaningful traffic before any charge |
@@ -282,8 +282,8 @@ Rough total for a `dev` environment left running continuously: **~$45-50/month**
 - **One long-lived AWS credential, by necessity: the SES SMTP key.** SES's SMTP interface only accepts credentials derived from an IAM user's access key — it can't use the instance role. `email/01-ses.sh` confines it to a dedicated IAM user whose only permission (via a group, per AWS's current guidance) is `ses:SendRawEmail` from exactly `SES_FROM_ADDRESS`, and it's stored only in the gitignored secrets file and an SSM `SecureString`. Rotate by re-running the script with the old key removed from the secrets file, then deleting the old key once redeployed.
 - **No SSH, anywhere.** All administration is SSM Session Manager / Run Command, both authenticated via IAM, both leaving a CloudTrail-auditable record of who ran what — a meaningfully better audit story than SSH key access even setting aside the "no open port" benefit.
 - **IMDSv2 enforced** (`HttpTokens=required`) on the instance, closing the classic SSRF-to-stolen-instance-credentials path IMDSv1 is vulnerable to.
-- **Least-privilege IAM everywhere it was practical**: the EC2 instance role can read only its own SSM parameter path and its own artifact bucket, never `*`. The (planned) GitHub Actions OIDC roles are split three ways by concern (infra/frontend/backend) rather than one broad role.
-- **Secrets never touch git or a Docker layer** — real values live only in SSM `SecureString` parameters, fetched at deploy time and written to a `chmod 600` file owned by a dedicated, unprivileged `orderpool` system user (never root).
+- **Least-privilege IAM everywhere it was practical**: the EC2 instance role can only read its own SSM parameter path, pull its own ECR repository and write its own log group (`ecr:GetAuthorizationToken`, which has no resource to scope to, is the one `*`). The GitHub Actions OIDC roles are split three ways by concern (infra/frontend/backend) rather than one broad role.
+- **Secrets never touch git or a Docker layer** — real values live only in SSM `SecureString` parameters, fetched at deploy time into a root-only `chmod 600` env file that the Docker daemon passes to the container, which runs as the image's unprivileged `node` user (never root). They're not in the image, so pulling it from ECR exposes none of them.
 - **Single EC2 instance, in-place restart deploys.** No blue/green, no canary, no ASG — a deliberate, discussed trade-off for this project's current dev/demo stage (see [Backend deployment](#8-backend-deployment)). A failed deploy is a full outage on that one target until `rollback-backend.sh` runs; there is no redundancy to fail over to today.
 - **`destroy.sh`'s bucket-emptying policy is irreversible by design** — see [Destroying environments](#16-destroying-environments).
 
