@@ -62,6 +62,8 @@ Frontend and backend infrastructure are independent of each other (either half c
 - `bash`, `aws` (CLI v2), `jq`, `git` — every script checks for these and fails immediately with a clear message if one is missing.
 - `docker` (with buildx, as in Docker Desktop) and `node`/`npm` — not needed to provision infrastructure, but required to deploy the applications from a laptop: `backend/deploy-backend.sh` builds the backend's Docker image, `frontend/deploy-frontend.sh` builds the frontend with npm.
 - An AWS account with `aws configure` (or `AWS_PROFILE`) already working — verify with `aws sts get-caller-identity`.
+- That identity (an IAM user you manage yourself; these scripts never change its permissions) needs full access to EC2 (which covers the load balancer), VPC, IAM, S3, CloudFront, Route 53, ACM, SSM, SES, **ECR** and **CloudWatch Logs**, plus `tag:GetResources` (for `destroy.sh`'s leftover check). When a service is added here, add its permission to that user too. To check actions before a run fails on one:
+  `aws iam simulate-principal-policy --policy-source-arn "$(aws sts get-caller-identity --query Arn --output text)" --action-names ecr:CreateRepository logs:CreateLogGroup --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text`
 - A Route 53 hosted zone already created for your domain (NS/SOA records set at your registrar) — this project uses subdomains within an existing zone, it doesn't create the zone itself.
 - A MongoDB Atlas cluster — see [MongoDB Atlas](#14-mongodb-atlas). Not provisioned by this repo.
 
