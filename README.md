@@ -93,20 +93,19 @@ cd infrastructure
 ./deploy.sh dev                              # provisions all AWS infrastructure
 cp config/dev.secrets.env.example config/dev.secrets.env
 $EDITOR config/dev.secrets.env               # fill in the real Atlas password, JWT secrets, etc.
-./email/01-ses.sh dev                        # SES domain + DNS + SMTP credentials -> secrets file (see §19)
-./deploy-apps.sh dev                         # config -> SSM, then both apps' CI deploys main
+./deploy-apps.sh dev                         # Atlas IP, SES SMTP creds (§19), config -> SSM, both apps' CI deploys main
 ./status.sh dev                              # live health check of everything above
 ./test/verify-dev.sh dev                     # pass/fail assertions — see below
 ```
 
-`deploy.sh` never builds or ships application code itself (see [GitHub Actions](#9-github-actions) for why that split matters). Its last step, when `config/<env>.secrets.env` already exists (as it does after a destroy, which leaves it on disk), is `deploy-apps.sh`; on a first build it stops and prints the steps above instead. `deploy-apps.sh <env>`:
+`deploy.sh` never builds or ships application code itself (see [GitHub Actions](#9-github-actions) for why that split matters). Its last step, when `config/<env>.secrets.env` already exists (as it does after a destroy, which leaves it on disk), is `deploy-apps.sh`; on a first build it stops and prints the steps above instead. So after the first build, bringing dev back is just `./deploy.sh dev`, answering two prompts. `deploy-apps.sh <env>` (also safe to run by itself, at any time):
 
 1. shows the backend instance's current public IP and waits for you to confirm it's on MongoDB Atlas's Network Access list — every rebuild gets a new IP, and Atlas isn't managed by this repo (see [MongoDB Atlas](#14-mongodb-atlas)), so this stays a manual step;
 2. runs `email/01-ses.sh`, which recreates the SES SMTP IAM user that `destroy.sh` deleted and, after asking, writes a new SMTP key into `config/<env>.secrets.env` — the one there died with the old user;
 3. pushes `config/<env>.secrets.env` to SSM with `backend/env-to-ssm.sh` — `destroy.sh` deleted it from there, and the backend can't start without it;
 4. runs `gh workflow run deploy.yml` on `main` in `order-pools-backend` and `order-pools-app`, so both are tested, built and deployed by CI exactly as a push would. While the environment was down, every push to either repo was tested but its deploy skipped, so this is what brings a rebuilt environment up to date.
 
-It only queues the two runs; follow them with `gh run list --repo <owner>/<repo> --workflow deploy.yml`. To deploy from the laptop instead of CI (needs `docker` and `node`/`npm`): `./backend/env-to-ssm.sh dev`, `./backend/deploy-backend.sh dev`, `./frontend/deploy-frontend.sh dev`.
+It only queues the two runs; follow them with `gh run list --repo <owner>/<repo> --workflow deploy.yml`. It warns if either repo has `DEPLOY_PAUSED` set ([GitHub Actions](#9-github-actions)), since that run would test but not deploy. To deploy from the laptop instead of CI (needs `docker` and `node`/`npm`): `./email/01-ses.sh dev`, `./backend/env-to-ssm.sh dev`, `./backend/deploy-backend.sh dev`, `./frontend/deploy-frontend.sh dev`.
 
 `test/verify-dev.sh` is read-only, like `status.sh`, but asserts explicit pass/fail per resource (existence, key config values, live HTTP checks) instead of just printing state — the closest thing this plain-bash toolkit has to a test suite, and a substitute for re-clicking through every AWS console page by hand after a change. Exits non-zero and lists every failure if anything's wrong.
 
@@ -173,12 +172,23 @@ order-pool-<env>-backend-deploy    -> scoped to the backend's ECR repository (pu
 
 **Workflows**, one per app repo (deliberately none in `order-pools-infrastructure` itself):
 
-- `order-pools-backend/.github/workflows/deploy.yml` — runs the unit tests, builds the Docker image, runs the whole API suite against that image (with a MongoDB replica set started from the repo's `docker-compose.yml`), pushes it to ECR as `:<commit SHA>`, then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` with that tag to do the actual render/SSM-send/poll mechanics.
+- `order-pools-backend/.github/workflows/deploy.yml` — runs the unit tests (Jest), builds the Docker image, runs the whole API suite against that image (with a MongoDB replica set started from the repo's `docker-compose.yml`), pushes it to ECR as `:<commit SHA>`, then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` with that tag to do the actual render/SSM-send/poll mechanics.
 - `order-pools-app/.github/workflows/deploy.yml` — fully self-contained: a `test` job (lint, Vitest, build), then a `deploy` job: build (with `VITE_API_BASE_URL` injected the same way `deploy-frontend.sh` does), `s3 sync` (two-pass cache headers), CloudFront invalidation, no cross-repo call.
 
 **Only deploying while the environment is up.** Dev is destroyed whenever it isn't in use, so both workflows test every push regardless, then check SSM for the environment's state parameters (`/order-pool/<env>/state/backend/*`, `.../state/frontend/*` — `deploy.sh` writes them, `destroy.sh` deletes them) before pushing or deploying anything. All there: deploy. None there: skip the deploy with a warning ("tested but NOT deployed"), and the run still passes. Only some there: fail, since that's a half-built or half-destroyed environment (check `./status.sh`). Those parameters are the flag — there's no separate "is it up" variable to keep in sync with reality. The check works with the environment gone because `destroy.sh` keeps the GitHub OIDC roles. Once the environment is rebuilt, `deploy-apps.sh` (run by `deploy.sh`) deploys what was skipped — see [Dev deployment](#5-dev-deployment).
 
-Both trigger on **push to `main`** (real continuous deployment) as well as manual `workflow_dispatch`, and both are confirmed working end-to-end against the live `dev` environment.
+**Pausing deploys while the environment is up: `DEPLOY_PAUSED`.** The one thing the state parameters can't express is a human decision to hold deploys back — say, while poking at dev by hand, or during a demo. For that, set an optional variable on the repo's GitHub environment:
+
+```bash
+gh variable set DEPLOY_PAUSED --env dev --body true --repo Abdulaziz-algharbi/order-pools-backend   # pause
+gh variable delete DEPLOY_PAUSED --env dev --repo Abdulaziz-algharbi/order-pools-backend            # resume
+```
+
+(and/or `order-pools-app` — each repo is paused on its own). While it's `true`, that repo's pushes are still tested, then the deploy is skipped with a "paused … tested but NOT deployed" warning and the run passes — the same shape as the environment being down. Anything else, or unset, deploys as normal. It's checked before the state parameters, so it also holds back the runs `deploy-apps.sh` dispatches (which warns about it). Resuming doesn't deploy by itself: re-run the latest workflow, or push. Unlike an "is it up" flag, this one isn't a copy of anything — nothing else knows you wanted to pause — so there's nothing for it to drift from.
+
+Both trigger on **push to `main`** (real continuous deployment) as well as manual `workflow_dispatch` (what `deploy-apps.sh` uses), and both are confirmed working end-to-end against the live `dev` environment — the backend's ECR/SSM path from CI too, since 2026-10-27.
+
+**The OIDC roles outlive the environment.** `destroy.sh` keeps them and `deploy.sh` never touches them, so a change to `iam/02-github-oidc-roles.sh` (e.g. a new permission for a workflow) reaches AWS only when you re-run `./iam/02-github-oidc-roles.sh <env>` yourself. It's idempotent: it updates the roles' trust and permission policies in place, and their ARNs (the GitHub variables below) don't change.
 
 **Why the backend calls a reusable workflow but the frontend doesn't, even though both mirror a local script**: reusable workflows (`on: workflow_call`) are GitHub's sanctioned way to share workflow logic across repos without a PAT or deploy key — unlike a plain `actions/checkout` of a different repo, which the default `GITHUB_TOKEN` cannot do for a private repo regardless of ownership (confirmed live: this is *why* `order-pools-infrastructure` is public — a called reusable workflow's own `checkout` step needs to read its own repo's files, e.g. `deploy-remote.sh.tmpl`, and that specifically requires the repo to be public or a PAT to be introduced; made public since nothing secret lives in it). The backend's deploy mechanics (render a template, send an SSM command, poll its status, poll target-group health) are substantial enough that duplicating them into `order-pools-backend`'s own workflow would be a real drift risk. The frontend's remaining logic after "build" is a handful of straightforward `aws s3`/`aws cloudfront` calls — small enough that the added indirection of a cross-repo call would cost more clarity than the duplication it avoids, which would cut against this project's own explicit "don't hide AWS CLI commands behind unnecessary abstraction" learning goal. Build itself (`npm ci`/`npm run build`) is inherently repo-local either way and was never a candidate for centralizing — it can only ever run where the app's own source is checked out.
 
@@ -188,8 +198,8 @@ Each repo needs these set as **environment variables** (not secrets — none of 
 
 | Repo | Variables |
 |---|---|
-| `order-pools-app` | `FRONTEND_DEPLOY_ROLE_ARN`, `AWS_REGION`, `BACKEND_DOMAIN` |
-| `order-pools-backend` | `BACKEND_DEPLOY_ROLE_ARN`, `AWS_REGION`, `BACKEND_PORT` |
+| `order-pools-app` | `FRONTEND_DEPLOY_ROLE_ARN`, `AWS_REGION`, `BACKEND_DOMAIN`; optionally `DEPLOY_PAUSED` |
+| `order-pools-backend` | `BACKEND_DEPLOY_ROLE_ARN`, `AWS_REGION`, `BACKEND_PORT`; optionally `DEPLOY_PAUSED` |
 
 A GitHub Actions runner resolves AWS resource IDs exactly the way your laptop does — `aws ssm get-parameter --name /order-pool/<env>/state/backend/instance-id`, etc. — which is the entire reason those IDs live in SSM Parameter Store as the canonical copy (`lib/state.sh`) rather than only in a local, gitignored cache file a runner could never see.
 
@@ -245,11 +255,14 @@ Both work because the instance's IAM role (`iam/01-ec2-instance-role.sh`) has `A
 | A script dies with "account does not match the account pinned" | Wrong `AWS_PROFILE`/credentials active for this environment. Confirm with `aws sts get-caller-identity`, or delete `config/<env>.local.env` if you deliberately want to re-point the environment. |
 | ACM cert stuck in `PENDING_VALIDATION` for a long time | Check the CNAME actually landed in Route 53: `aws route53 list-resource-record-sets --hosted-zone-id <id>`. DNS validation is usually fast but can occasionally take longer; the scripts' `wait certificate-validated` calls are safe to re-run. |
 | `frontend/02-cloudfront.sh` or `destroy.sh`'s CloudFront step seems to hang | Not hanging — a distribution create/disable genuinely takes 5-15+ minutes to propagate to every edge location worldwide. This is CloudFront's own process, not something a script controls. |
-| Target group shows the instance as `unhealthy` | SSH in via `aws ssm start-session --target <id>`, check `systemctl status order-pool-backend` and `journalctl -u order-pool-backend`. Common cause: `config/<env>.secrets.env` was never pushed (`backend/env-to-ssm.sh`) before the first deploy. |
+| Target group shows the instance as `unhealthy` | Read the container's logs: `aws logs tail /order-pool/<env>/backend --since 30m`, or on the instance (`aws ssm start-session --target <id>`) `sudo docker compose -f /opt/order-pool-backend/compose.yml ps -a` / `logs api`. Common causes: the backend config isn't in SSM (`backend/env-to-ssm.sh`, which `deploy-apps.sh` runs), or the instance's IP isn't on Atlas's allow-list (next row). |
 | Backend can't reach Atlas / connection refused or times out | Check the EC2 instance's current public IP (`./status.sh <env>`) is actually on Atlas's Network Access list — see the Atlas section above about IPs changing if the instance is ever relaunched. |
 | `deploy-backend.sh` reports a failed SSM command | It prints the remote script's stdout/stderr directly — read that first. If a previously-working release is now down, run `backend/rollback-backend.sh <env>`. |
-| Registration succeeds but no verification email arrives | Check, in order: backend logs (`journalctl -u order-pool-backend`) for the nodemailer error; `./test/verify-dev.sh` for the 587 egress rule and SES identity status; whether the account is still in the SES **sandbox** (only verified recipients get mail — `./status.sh` shows it); the recipient's spam folder. |
+| Registration succeeds but no verification email arrives | Check, in order: backend logs (`aws logs tail /order-pool/<env>/backend --since 1h`) for the nodemailer error — `535 Authentication Credentials Invalid` after a rebuild means the SMTP key died with the destroyed SMTP user: run `./deploy-apps.sh <env>` (or `email/01-ses.sh`, `env-to-ssm.sh` and a backend deploy); `./test/verify-dev.sh` for the 587 egress rule and SES identity status; whether the account is still in the SES **sandbox** (only verified recipients get mail — `./status.sh` shows it); the recipient's spam folder. |
 | Backend logs `AccessDenied ... ses:SendRawEmail` | The From address doesn't match `SES_FROM_ADDRESS` (the IAM policy pins it) — the backend's `SMTP_FROM` must be the value `email/01-ses.sh` wrote. Re-run it, then `env-to-ssm.sh` and redeploy. |
+| A deploy run passes but warns "tested but NOT deployed" | Expected: either the environment is down (no `/order-pool/<env>/state/*`), or the repo has `DEPLOY_PAUSED=true`. The warning says which. See [GitHub Actions](#9-github-actions). |
+| A deploy run fails with "only partly there — missing …" | The environment is half-built or half-destroyed. `./status.sh <env>`, then finish `./deploy.sh` or `./destroy.sh`. |
+| Backend CI fails with `AccessDenied` on an AWS call (e.g. `ecr:GetAuthorizationToken`) | The live OIDC role predates a permission added to `iam/02-github-oidc-roles.sh`. Re-run `./iam/02-github-oidc-roles.sh <env>`, then re-run the workflow. |
 | DNS not resolving yet after a Route 53 change | The scripts already wait for `INSYNC` on the change itself, but resolver caches elsewhere (your ISP, browser) can still lag. Check directly with `dig +short <domain>` against a public resolver: `dig @8.8.8.8 +short <domain>`. |
 
 ## 16. Destroying environments
@@ -264,7 +277,7 @@ Tears down everything `deploy.sh` created, in reverse dependency order, and requ
 
 Every teardown step tolerates the resource already being gone (a partial/interrupted destroy, or something removed by hand in the console) rather than hard-failing — re-running `destroy.sh` after any failure is always safe. It also wipes every SSM parameter under `/order-pool/<env>/` (state *and* secrets), so a destroyed environment doesn't leave an Atlas password sitting in Parameter Store.
 
-`config/<env>.local.env` and `config/<env>.secrets.env` are deliberately left on disk after a destroy — delete them yourself if you're really done with that environment.
+`config/<env>.local.env` and `config/<env>.secrets.env` are deliberately left on disk after a destroy — delete them yourself if you're really done with that environment. Keeping the secrets file is what lets `./deploy.sh <env>` bring the apps straight back (via `deploy-apps.sh`). While the environment is down, both apps' CI keeps testing every push and skips the deploy ([GitHub Actions](#9-github-actions)).
 
 ## 17. Estimated AWS cost (dev environment, us/eu region, rough)
 
@@ -299,7 +312,7 @@ Rough total for a `dev` environment left running continuously: **~$45-50/month**
 
 ## 19. Email (AWS SES)
 
-The backend sends email (today: email-verification links, see `order-pools-backend`'s `auth/email-verification.ts`) with nodemailer over SMTP. In AWS that's **Amazon SES's SMTP interface**, set up by two scripts in `email/` — deliberately not part of `deploy.sh`, like `iam/02-github-oidc-roles.sh`: the first writes secrets into your local secrets file, and the second is a request reviewed by a person at AWS.
+The backend sends email (today: email-verification links, see `order-pools-backend`'s `auth/email-verification.ts`) with nodemailer over SMTP. In AWS that's **Amazon SES's SMTP interface**, set up by two scripts in `email/`. `deploy.sh` doesn't run them itself, but `deploy-apps.sh` (its last step) runs the first, since `destroy.sh` deletes the SMTP user it creates; the second is a request reviewed by a person at AWS, run once by hand.
 
 **`email/01-ses.sh <env>`** — idempotent, safe to re-run:
 
@@ -318,7 +331,7 @@ Then push and redeploy as usual: `./backend/env-to-ssm.sh <env>` and a backend d
 
 **Region.** SES identities, quotas, sandbox status and SMTP passwords are all regional; everything here uses the environment's `AWS_REGION` (`eu-north-1` has an SES SMTP endpoint: `email-smtp.eu-north-1.amazonaws.com`).
 
-**Teardown.** `destroy.sh` deletes the environment's SMTP IAM user (and its keys) and group — the credentials are environment-scoped. It deliberately **leaves the SES domain identity and its DNS records**: an identity belongs to the account + region, so another environment sending from the same domain would break if one environment's teardown deleted it. It costs nothing to keep; remove it by hand if you're done with the domain entirely.
+**Teardown.** `destroy.sh` deletes the environment's SMTP IAM user (and its keys) and group — the credentials are environment-scoped. It deliberately **leaves the SES domain identity and its DNS records**: an identity belongs to the account + region, so another environment sending from the same domain would break if one environment's teardown deleted it. It costs nothing to keep; remove it by hand if you're done with the domain entirely. On the next rebuild, `deploy-apps.sh` runs `01-ses.sh`, which recreates the user and group and — after asking, since the secrets file still holds the dead key's credentials — mints a new key.
 
 **Not yet set up:** bounce and complaint handling (an SES configuration set + SNS notifications feeding a suppression step in the app). Worth adding before any real volume — repeated sends to bouncing addresses harm the account's sending reputation.
 

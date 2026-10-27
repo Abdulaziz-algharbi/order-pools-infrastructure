@@ -90,6 +90,14 @@ log_info "--- Dispatching each app's deploy workflow on main ---"
 for repo in $APP_REPOS; do
   gh workflow run deploy.yml --repo "${GITHUB_OWNER}/${repo}" --ref main -f environment="$ENVIRONMENT"
   log_info "Queued ${GITHUB_OWNER}/${repo}: deploy.yml on main (environment ${ENVIRONMENT})."
+  # A paused repo (README §9) still runs its tests but skips the deploy —
+  # say so here rather than leave it to be found in the run's warnings.
+  # The environment's variable wins over the repository's, as in Actions.
+  paused="$(gh variable get DEPLOY_PAUSED --env "$ENVIRONMENT" --repo "${GITHUB_OWNER}/${repo}" 2>/dev/null \
+    || gh variable get DEPLOY_PAUSED --repo "${GITHUB_OWNER}/${repo}" 2>/dev/null || true)"
+  if [[ "$paused" == "true" ]]; then
+    log_warn "${repo} has DEPLOY_PAUSED=true, so that run will test but NOT deploy. To resume: gh variable delete DEPLOY_PAUSED --env ${ENVIRONMENT} --repo ${GITHUB_OWNER}/${repo}, then re-run it."
+  fi
 done
 echo
 
