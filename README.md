@@ -102,8 +102,9 @@ $EDITOR config/dev.secrets.env               # fill in the real Atlas password, 
 `deploy.sh` never builds or ships application code itself (see [GitHub Actions](#9-github-actions) for why that split matters). Its last step, when `config/<env>.secrets.env` already exists (as it does after a destroy, which leaves it on disk), is `deploy-apps.sh`; on a first build it stops and prints the steps above instead. `deploy-apps.sh <env>`:
 
 1. shows the backend instance's current public IP and waits for you to confirm it's on MongoDB Atlas's Network Access list — every rebuild gets a new IP, and Atlas isn't managed by this repo (see [MongoDB Atlas](#14-mongodb-atlas)), so this stays a manual step;
-2. pushes `config/<env>.secrets.env` to SSM with `backend/env-to-ssm.sh` — `destroy.sh` deleted it from there, and the backend can't start without it;
-3. runs `gh workflow run deploy.yml` on `main` in `order-pools-backend` and `order-pools-app`, so both are tested, built and deployed by CI exactly as a push would. While the environment was down, every push to either repo was tested but its deploy skipped, so this is what brings a rebuilt environment up to date.
+2. runs `email/01-ses.sh`, which recreates the SES SMTP IAM user that `destroy.sh` deleted and, after asking, writes a new SMTP key into `config/<env>.secrets.env` — the one there died with the old user;
+3. pushes `config/<env>.secrets.env` to SSM with `backend/env-to-ssm.sh` — `destroy.sh` deleted it from there, and the backend can't start without it;
+4. runs `gh workflow run deploy.yml` on `main` in `order-pools-backend` and `order-pools-app`, so both are tested, built and deployed by CI exactly as a push would. While the environment was down, every push to either repo was tested but its deploy skipped, so this is what brings a rebuilt environment up to date.
 
 It only queues the two runs; follow them with `gh run list --repo <owner>/<repo> --workflow deploy.yml`. To deploy from the laptop instead of CI (needs `docker` and `node`/`npm`): `./backend/env-to-ssm.sh dev`, `./backend/deploy-backend.sh dev`, `./frontend/deploy-frontend.sh dev`.
 

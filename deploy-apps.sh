@@ -67,6 +67,18 @@ log_info "(Then remove the previous instance's entry, if it's still there.)"
 confirm "Is ${INSTANCE_PUBLIC_IP} on Atlas's Network Access list (and showing Active)?"
 echo
 
+# --- SES SMTP credentials: recreated on every rebuild ---------------------
+# destroy.sh deletes the SES SMTP IAM user and its access keys (a working
+# sending key shouldn't outlive its environment), but leaves the secrets
+# file holding the SMTP_USER/SMTP_PASS derived from that dead key. Pushed
+# as they are, the backend would fail to log in to SES on its first email.
+# email/01-ses.sh is idempotent: it reuses the domain identity, DNS and
+# group, recreates the user, and mints a new key into the secrets file
+# only when the one there isn't the user's active key (asking first).
+log_info "--- SES SMTP credentials (email/01-ses.sh) ---"
+"${INFRA_ROOT}/email/01-ses.sh" "$ENVIRONMENT"
+echo
+
 log_info "--- Backend config: ${SECRETS_FILE} -> SSM ---"
 "${INFRA_ROOT}/backend/env-to-ssm.sh" "$ENVIRONMENT"
 echo
