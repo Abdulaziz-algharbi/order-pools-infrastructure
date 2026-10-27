@@ -61,6 +61,7 @@ Frontend and backend infrastructure are independent of each other (either half c
 
 - `bash`, `aws` (CLI v2), `jq`, `git` — every script checks for these and fails immediately with a clear message if one is missing.
 - `docker` (with buildx, as in Docker Desktop) and `node`/`npm` — not needed to provision infrastructure, but required to deploy the applications from a laptop: `backend/deploy-backend.sh` builds the backend's Docker image, `frontend/deploy-frontend.sh` builds the frontend with npm.
+- `gh` (GitHub CLI), logged in with the `workflow` scope (`gh auth login`) — only for `deploy-apps.sh`, which asks each app repo's GitHub Actions workflow to deploy (see [Dev deployment](#5-dev-deployment)).
 - An AWS account with `aws configure` (or `AWS_PROFILE`) already working — verify with `aws sts get-caller-identity`.
 - That identity (an IAM user you manage yourself; these scripts never change its permissions) needs full access to EC2 (which covers the load balancer), VPC, IAM, S3, CloudFront, Route 53, ACM, SSM, SES, **ECR** and **CloudWatch Logs**, plus `tag:GetResources` (for `destroy.sh`'s leftover check). When a service is added here, add its permission to that user too. To check actions before a run fails on one:
   `aws iam simulate-principal-policy --policy-source-arn "$(aws sts get-caller-identity --query Arn --output text)" --action-names ecr:CreateRepository logs:CreateLogGroup --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text`
@@ -93,14 +94,17 @@ cd infrastructure
 cp config/dev.secrets.env.example config/dev.secrets.env
 $EDITOR config/dev.secrets.env               # fill in the real Atlas password, JWT secrets, etc.
 ./email/01-ses.sh dev                        # SES domain + DNS + SMTP credentials -> secrets file (see §19)
-./backend/env-to-ssm.sh dev                  # pushes them to SSM Parameter Store
-./backend/deploy-backend.sh dev              # builds + ships order-pools-backend
-./frontend/deploy-frontend.sh dev            # builds + ships order-pools-app
+./deploy-apps.sh dev                         # config -> SSM, then both apps' CI deploys main
 ./status.sh dev                              # live health check of everything above
 ./test/verify-dev.sh dev                     # pass/fail assertions — see below
 ```
 
-`deploy.sh` deliberately stops after infrastructure — it never builds or ships application code itself (see [GitHub Actions](#9-github-actions) for why that split matters).
+`deploy.sh` never builds or ships application code itself (see [GitHub Actions](#9-github-actions) for why that split matters). Its last step, when `config/<env>.secrets.env` already exists (as it does after a destroy, which leaves it on disk), is `deploy-apps.sh`; on a first build it stops and prints the steps above instead. `deploy-apps.sh <env>`:
+
+1. pushes `config/<env>.secrets.env` to SSM with `backend/env-to-ssm.sh` — `destroy.sh` deleted it from there, and the backend can't start without it;
+2. runs `gh workflow run deploy.yml` on `main` in `order-pools-backend` and `order-pools-app`, so both are tested, built and deployed by CI exactly as a push would. While the environment was down, every push to either repo was tested but its deploy skipped, so this is what brings a rebuilt environment up to date.
+
+It only queues the two runs; follow them with `gh run list --repo <owner>/<repo> --workflow deploy.yml`. To deploy from the laptop instead of CI (needs `docker` and `node`/`npm`): `./backend/env-to-ssm.sh dev`, `./backend/deploy-backend.sh dev`, `./frontend/deploy-frontend.sh dev`.
 
 `test/verify-dev.sh` is read-only, like `status.sh`, but asserts explicit pass/fail per resource (existence, key config values, live HTTP checks) instead of just printing state — the closest thing this plain-bash toolkit has to a test suite, and a substitute for re-clicking through every AWS console page by hand after a change. Exits non-zero and lists every failure if anything's wrong.
 
@@ -167,8 +171,10 @@ order-pool-<env>-backend-deploy    -> scoped to the backend's ECR repository (pu
 
 **Workflows**, one per app repo (deliberately none in `order-pools-infrastructure` itself):
 
-- `order-pools-backend/.github/workflows/deploy.yml` — runs the unit tests, builds the Docker image, runs the whole API suite against that image (with a MongoDB replica set started from the repo's `docker-compose.yml`), pushes it to ECR as `:<commit SHA>` (skipped, with a warning, when the environment is destroyed), then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` with that tag to do the actual render/SSM-send/poll mechanics.
-- `order-pools-app/.github/workflows/deploy.yml` — fully self-contained: build (with `VITE_API_BASE_URL` injected the same way `deploy-frontend.sh` does), `s3 sync` (two-pass cache headers), CloudFront invalidation, no cross-repo call.
+- `order-pools-backend/.github/workflows/deploy.yml` — runs the unit tests, builds the Docker image, runs the whole API suite against that image (with a MongoDB replica set started from the repo's `docker-compose.yml`), pushes it to ECR as `:<commit SHA>`, then calls a **reusable workflow** defined in `order-pools-infrastructure/.github/workflows/deploy-backend.yml` with that tag to do the actual render/SSM-send/poll mechanics.
+- `order-pools-app/.github/workflows/deploy.yml` — fully self-contained: a `test` job (lint, Vitest, build), then a `deploy` job: build (with `VITE_API_BASE_URL` injected the same way `deploy-frontend.sh` does), `s3 sync` (two-pass cache headers), CloudFront invalidation, no cross-repo call.
+
+**Only deploying while the environment is up.** Dev is destroyed whenever it isn't in use, so both workflows test every push regardless, then check SSM for the environment's state parameters (`/order-pool/<env>/state/backend/*`, `.../state/frontend/*` — `deploy.sh` writes them, `destroy.sh` deletes them) before pushing or deploying anything. All there: deploy. None there: skip the deploy with a warning ("tested but NOT deployed"), and the run still passes. Only some there: fail, since that's a half-built or half-destroyed environment (check `./status.sh`). Those parameters are the flag — there's no separate "is it up" variable to keep in sync with reality. The check works with the environment gone because `destroy.sh` keeps the GitHub OIDC roles. Once the environment is rebuilt, `deploy-apps.sh` (run by `deploy.sh`) deploys what was skipped — see [Dev deployment](#5-dev-deployment).
 
 Both trigger on **push to `main`** (real continuous deployment) as well as manual `workflow_dispatch`, and both are confirmed working end-to-end against the live `dev` environment.
 
