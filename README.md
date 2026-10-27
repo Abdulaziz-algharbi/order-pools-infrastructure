@@ -101,8 +101,9 @@ $EDITOR config/dev.secrets.env               # fill in the real Atlas password, 
 
 `deploy.sh` never builds or ships application code itself (see [GitHub Actions](#9-github-actions) for why that split matters). Its last step, when `config/<env>.secrets.env` already exists (as it does after a destroy, which leaves it on disk), is `deploy-apps.sh`; on a first build it stops and prints the steps above instead. `deploy-apps.sh <env>`:
 
-1. pushes `config/<env>.secrets.env` to SSM with `backend/env-to-ssm.sh` — `destroy.sh` deleted it from there, and the backend can't start without it;
-2. runs `gh workflow run deploy.yml` on `main` in `order-pools-backend` and `order-pools-app`, so both are tested, built and deployed by CI exactly as a push would. While the environment was down, every push to either repo was tested but its deploy skipped, so this is what brings a rebuilt environment up to date.
+1. shows the backend instance's current public IP and waits for you to confirm it's on MongoDB Atlas's Network Access list — every rebuild gets a new IP, and Atlas isn't managed by this repo (see [MongoDB Atlas](#14-mongodb-atlas)), so this stays a manual step;
+2. pushes `config/<env>.secrets.env` to SSM with `backend/env-to-ssm.sh` — `destroy.sh` deleted it from there, and the backend can't start without it;
+3. runs `gh workflow run deploy.yml` on `main` in `order-pools-backend` and `order-pools-app`, so both are tested, built and deployed by CI exactly as a push would. While the environment was down, every push to either repo was tested but its deploy skipped, so this is what brings a rebuilt environment up to date.
 
 It only queues the two runs; follow them with `gh run list --repo <owner>/<repo> --workflow deploy.yml`. To deploy from the laptop instead of CI (needs `docker` and `node`/`npm`): `./backend/env-to-ssm.sh dev`, `./backend/deploy-backend.sh dev`, `./frontend/deploy-frontend.sh dev`.
 
@@ -233,7 +234,7 @@ Both work because the instance's IAM role (`iam/01-ec2-instance-role.sh`) has `A
 
 1. Create a cluster (M0 free tier is fine for dev — it's still a replica set, so Mongoose transactions work exactly like the M10+ dedicated tier).
 2. Database Access → create a DB user scoped to the `order-pool` database.
-3. **Network Access**: allow-list the backend EC2 instance's public IP — get it from `./status.sh <env>` (row "EC2 public IP") or the output of `backend/01-ec2-instance.sh`. This is the instance's *own* public IP, not a NAT Gateway Elastic IP, because this project has no NAT Gateway (see [Security considerations](#18-security-considerations)). It stays stable for the life of a running instance, but **will change if the instance is ever terminated and relaunched** — re-check and update Atlas's allow-list if that happens.
+3. **Network Access**: allow-list the backend EC2 instance's public IP — get it from `./status.sh <env>` (row "EC2 public IP") or the output of `backend/01-ec2-instance.sh`. This is the instance's *own* public IP, not a NAT Gateway Elastic IP, because this project has no NAT Gateway (see [Security considerations](#18-security-considerations)). It stays stable for the life of a running instance, but **will change if the instance is ever terminated and relaunched** — re-check and update Atlas's allow-list if that happens. `deploy-apps.sh` (run by `deploy.sh`) prints the current IP and waits for you to confirm it's there before deploying the backend.
 4. Grab the `mongodb+srv://` connection string and put it, with the real password, into `config/<env>.secrets.env`'s `PROD_MONGO_URI` — no `replicaSet=`/`directConnection=` query params needed (unlike local dev's single-node replica set), since an Atlas cluster's SRV record already encodes everything the driver needs.
 
 ## 15. Troubleshooting

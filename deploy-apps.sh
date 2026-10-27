@@ -45,6 +45,28 @@ SECRETS_FILE="${INFRA_ROOT}/config/${ENVIRONMENT}.secrets.env"
 [[ -f "$SECRETS_FILE" ]] || die "Missing ${SECRETS_FILE} — the backend's config. Copy config/${ENVIRONMENT}.secrets.env.example to that path and fill it in first (see README §5)."
 gh auth status >/dev/null 2>&1 || die "gh isn't logged in to GitHub — run 'gh auth login' (it needs the 'workflow' scope to dispatch a workflow)."
 
+# --- Atlas's Network Access list: the one step that stays manual -------
+# Atlas only accepts connections from IPs on its allow-list, and the
+# backend reaches it from the instance's own public IP (no NAT Gateway,
+# no Elastic IP — see README §14). Every rebuild launches a new instance
+# with a new IP, and so does a stop/start, so it's read live here rather
+# than from the state recorded at launch. Atlas isn't managed by this
+# repo (its API needs credentials this project doesn't hold), so this
+# waits for a human to add it: without it, the backend's deploy starts a
+# container that can't reach its database and fails its health check.
+INSTANCE_ID="$(get_output "$ENVIRONMENT" backend/instance-id)"
+[[ -n "$INSTANCE_ID" && "$INSTANCE_ID" != "None" ]] || die "No backend instance recorded for '${ENVIRONMENT}' — run ./deploy.sh ${ENVIRONMENT} first."
+INSTANCE_PUBLIC_IP="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+[[ -n "$INSTANCE_PUBLIC_IP" && "$INSTANCE_PUBLIC_IP" != "None" ]] || die "Instance ${INSTANCE_ID} has no public IP (is it running? ./status.sh ${ENVIRONMENT})."
+
+log_info "--- MongoDB Atlas: allow the backend's IP ---"
+log_info "The backend instance's public IP is: ${INSTANCE_PUBLIC_IP}"
+log_info "In Atlas: Security → Network Access → Add IP Address → ${INSTANCE_PUBLIC_IP}/32"
+log_info "(Then remove the previous instance's entry, if it's still there.)"
+confirm "Is ${INSTANCE_PUBLIC_IP} on Atlas's Network Access list (and showing Active)?"
+echo
+
 log_info "--- Backend config: ${SECRETS_FILE} -> SSM ---"
 "${INFRA_ROOT}/backend/env-to-ssm.sh" "$ENVIRONMENT"
 echo
